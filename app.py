@@ -1,0 +1,479 @@
+# -*- coding: utf-8 -*-
+"""tecnovinyl-api · API pública y servidor MCP de la tienda de Tecnovinyl (01/10/2026).
+
+Un cliente validado recibe una clave (tv_live_…) desde el panel y con ella su agente o su software
+puede consultar el catálogo, pedir precios con SU tarifa y crear pedidos. Los pedidos nacen
+«pendientes de confirmación» y se confirman en una segunda llamada, con el total a la vista.
+
+Toda la lógica de precios y de pedidos vive en la base de datos (funciones api_* de 31-api.sql);
+este servidor solo valida, traduce y documenta. Variables: SUPABASE_URL, SUPABASE_SERVICE_KEY.
+"""
+import os, re, json, time, asyncio
+from typing import Any, Optional
+import httpx
+from fastapi import FastAPI, HTTPException, Header, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
+from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.transport_security import TransportSecuritySettings
+
+SB = os.environ.get("SUPABASE_URL", "https://vqfcfbqlycjgqmdfympr.supabase.co").rstrip("/")
+KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+TIENDA = "https://www.tecnovinyl.com/tienda/"
+API_URL = os.environ.get("API_URL", "https://api.tecnovinyl.com")
+VERSION = "1.0"
+
+if not KEY:
+    print("AVISO: falta SUPABASE_SERVICE_KEY; las llamadas a la base de datos fallarán")
+
+_http = httpx.AsyncClient(base_url=SB + "/rest/v1", timeout=40,
+                          headers={"apikey": KEY, "Authorization": "Bearer " + KEY})
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, msg: str):
+        self.status, self.msg = status, msg
+
+
+async def rest(path: str, params: Optional[dict] = None) -> Any:
+    r = await _http.get(path, params=params)
+    if r.status_code >= 400:
+        raise ApiError(502, "error de catálogo: " + r.text[:200])
+    return r.json()
+
+
+async def rpc(fn: str, body: dict) -> Any:
+    r = await _http.post("/rpc/" + fn, json=body, headers={"Content-Type": "application/json"})
+    if r.status_code >= 400:
+        try:
+            msg = r.json().get("message") or r.text
+        except Exception:
+            msg = r.text
+        code = 401 if r.status_code == 403 and "clave" in (msg or "") else 400
+        raise ApiError(code, msg[:300])
+    return r.json()
+
+
+def clave_de(authorization: Optional[str], x_api_key: Optional[str]) -> str:
+    k = (x_api_key or "").strip()
+    if not k and authorization:
+        m = re.match(r"^\s*Bearer\s+(.+)$", authorization, re.I)
+        if m:
+            k = m.group(1).strip()
+    if not k or not re.match(r"^tv_[a-z]+_[0-9a-f]{48}$", k):
+        raise ApiError(401, "Falta la clave de API (cabecera Authorization: Bearer tv_live_…)")
+    return k
+
+
+# ----------------------------------------------------------------------------- catálogo (sin precios)
+_cache: dict = {}
+
+
+async def cached(key: str, ttl: int, fn):
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and hit[0] > now:
+        return hit[1]
+    v = await fn()
+    _cache[key] = (now + ttl, v)
+    return v
+
+
+async def categorias() -> list:
+    async def f():
+        cats = await rest("/categorias", {"select": "id,nombre,padre_id,orden", "order": "orden,nombre"})
+        n = await rest("/productos_publicos", {"select": "categoria_id"})
+        cnt: dict = {}
+        for p in n:
+            cnt[p["categoria_id"]] = cnt.get(p["categoria_id"], 0) + 1
+        return [dict(c, productos=cnt.get(c["id"], 0)) for c in cats]
+    return await cached("cats", 300, f)
+
+
+def norm(s: str) -> str:
+    import unicodedata
+    return "".join(ch for ch in unicodedata.normalize("NFD", (s or "").lower()) if unicodedata.category(ch) != "Mn")
+
+
+async def lista_productos() -> list:
+    async def f():
+        return await rest("/productos_publicos", {
+            "select": "id,slug,nombre,tipo,categoria_id,marca,descripcion_corta,unidad_venta,bajo_pedido,"
+                      "variantes_publicas(referencia_ahora,activa)",
+            "order": "nombre"})
+    return await cached("prods", 120, f)
+
+
+def descendientes(cats: list, cid: str) -> set:
+    out, pend = set(), [cid]
+    while pend:
+        c = pend.pop()
+        if c in out:
+            continue
+        out.add(c)
+        pend += [x["id"] for x in cats if x["padre_id"] == c]
+    return out
+
+
+async def buscar(q: str = "", categoria: str = "", limite: int = 50) -> list:
+    prods, cats = await lista_productos(), await categorias()
+    nombre_cat = {c["id"]: c["nombre"] for c in cats}
+    sel = prods
+    if categoria:
+        ids = descendientes(cats, categoria)
+        sel = [p for p in sel if p["categoria_id"] in ids]
+    if q:
+        t = norm(q).split()
+        def ok(p):
+            texto = norm(" ".join([p["nombre"], p.get("descripcion_corta") or "", p.get("marca") or "",
+                                   nombre_cat.get(p["categoria_id"], ""),
+                                   " ".join((v.get("referencia_ahora") or "") for v in (p.get("variantes_publicas") or []))]))
+            return all(w in texto for w in t)
+        sel = [p for p in sel if ok(p)]
+        # primero los que llevan todas las palabras en el nombre, luego por nombre
+        sel.sort(key=lambda p: (0 if all(w in norm(p["nombre"]) for w in t) else 1, norm(p["nombre"])))
+    out = []
+    for p in sel[:max(1, min(limite, 200))]:
+        out.append({"producto_id": p["id"], "slug": p["slug"], "nombre": p["nombre"], "tipo": p["tipo"],
+                    "categoria": nombre_cat.get(p["categoria_id"]), "categoria_id": p["categoria_id"],
+                    "descripcion_corta": p.get("descripcion_corta"), "bajo_pedido": p.get("bajo_pedido"),
+                    "url": TIENDA + "#/p/" + p["slug"]})
+    return out
+
+
+TIPOS = {"variantes": "Producto con combinaciones (color, medida…): pide el precio y haz el pedido con variante_id.",
+         "simple": "Producto único: tiene una sola combinación (variante_id).",
+         "medidas": "Producto a medida: pásale ancho_mm y alto_mm (y las opciones) a /v1/precio/medidas y al pedido.",
+         "tabla": "Producto por tabla de opciones: elige las opciones y usa /v1/precio/medidas.",
+         "dxf": "Producto fabricado a partir de un archivo DXF: por API solo se puede consultar; el pedido se hace desde la tienda subiendo el archivo."}
+
+
+async def ficha(id_o_slug: str) -> dict:
+    filtro = {"id": "eq." + id_o_slug} if re.match(r"^[0-9a-f-]{36}$", id_o_slug) else {"slug": "eq." + id_o_slug}
+    r = await rest("/productos_publicos", dict(filtro, **{
+        "select": "id,slug,nombre,tipo,categoria_id,marca,descripcion_corta,descripcion,unidad_venta,limites,plazo,bajo_pedido,"
+                  "atributos(id,nombre,orden,atributo_valores(id,valor,codigo,orden)),"
+                  "variantes_publicas(id,valores,activa,referencia_ahora),"
+                  "caracteristicas(id,nombre,magnitud,oculta,ayuda,orden,caracteristica_valores(id,nombre,orden,por_defecto))"}))
+    if not r:
+        raise ApiError(404, "producto no encontrado")
+    p = r[0]
+    cats = await categorias()
+    nombre_cat = {c["id"]: c["nombre"] for c in cats}
+    vals = {}
+    atributos = []
+    for a in sorted(p.get("atributos") or [], key=lambda a: a["orden"]):
+        vs = sorted(a.get("atributo_valores") or [], key=lambda v: v["orden"])
+        for v in vs:
+            vals[v["id"]] = (a["nombre"], v["valor"])
+        atributos.append({"nombre": a["nombre"], "valores": [{"valor": v["valor"], "codigo": v.get("codigo")} for v in vs]})
+    combinaciones = []
+    for v in p.get("variantes_publicas") or []:
+        if not v.get("activa"):
+            continue
+        combo = {vals[x][0]: vals[x][1] for x in (v.get("valores") or []) if x in vals}
+        combinaciones.append({"variante_id": v["id"], "combinacion": combo, "referencia": v.get("referencia_ahora")})
+    opciones = []
+    for c in sorted(p.get("caracteristicas") or [], key=lambda c: c["orden"]):
+        if c.get("oculta"):
+            continue
+        cv = sorted(c.get("caracteristica_valores") or [], key=lambda x: x["orden"])
+        if len(cv) <= 1:
+            continue
+        opciones.append({"nombre": c["nombre"], "ayuda": c.get("ayuda"),
+                         "valores": [x["nombre"] for x in cv],
+                         "por_defecto": next((x["nombre"] for x in cv if x.get("por_defecto")), cv[0]["nombre"])})
+    return {"producto_id": p["id"], "slug": p["slug"], "nombre": p["nombre"], "tipo": p["tipo"], "como_se_pide": TIPOS.get(p["tipo"]),
+            "categoria": nombre_cat.get(p["categoria_id"]), "categoria_id": p["categoria_id"], "marca": p.get("marca"),
+            "descripcion_corta": p.get("descripcion_corta"), "descripcion": p.get("descripcion"),
+            "unidad_venta": p.get("unidad_venta"), "plazo": p.get("plazo"), "bajo_pedido": p.get("bajo_pedido"),
+            "limites_mm": p.get("limites"), "atributos": atributos, "combinaciones": combinaciones,
+            "opciones": opciones, "url": TIENDA + "#/p/" + p["slug"]}
+
+
+def magnitudes_de(ancho_mm: Optional[float], alto_mm: Optional[float]) -> dict:
+    a, h = float(ancho_mm or 0), float(alto_mm or 0)
+    m2 = a * h / 1e6
+    return {"m2_ancho_alto": round(m2, 4), "perimetro": round(2 * (a + h) / 1000, 4), "m2_pieza": round(m2, 4), "n_piezas": 1}
+
+
+def eur(c) -> str:
+    try:
+        return f"{int(c) / 100:,.2f} €".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return "—"
+
+
+# ----------------------------------------------------------------------------- operaciones con clave
+async def yo(clave: str) -> dict:
+    return await rpc("api_cliente", {"p_clave": clave})
+
+
+async def precio_variante(clave: str, variante_id: str, cantidad: float = 1) -> dict:
+    r = await rpc("api_precio_variante", {"p_clave": clave, "p_variante": variante_id, "p_cantidad": cantidad})
+    r["unitario"] = eur(r.get("unitario_cent")); r["total_sin_iva"] = eur(r.get("total_cent"))
+    return r
+
+
+async def precio_medidas(clave: str, producto_id: str, seleccion: dict, ancho_mm=None, alto_mm=None, magnitudes=None, cantidad: int = 1) -> dict:
+    mags = magnitudes or magnitudes_de(ancho_mm, alto_mm)
+    r = await rpc("api_precio_medidas", {"p_clave": clave, "p_producto": producto_id, "p_seleccion": seleccion or {},
+                                         "p_magnitudes": mags, "p_cantidad": cantidad})
+    r["magnitudes"] = mags
+    r["unitario"] = eur(r.get("unitario_cent")); r["total_sin_iva"] = eur(r.get("total_cent"))
+    return r
+
+
+def normaliza_lineas(lineas: list) -> list:
+    out = []
+    for l in lineas or []:
+        l = dict(l)
+        if l.get("variante_id"):
+            out.append({"variante_id": l["variante_id"], "cantidad": l.get("cantidad", 1), "instrucciones": l.get("instrucciones")})
+        elif l.get("producto_id"):
+            mags = l.get("magnitudes") or magnitudes_de(l.get("ancho_mm"), l.get("alto_mm"))
+            out.append({"producto_id": l["producto_id"], "seleccion": l.get("seleccion") or {}, "magnitudes": mags,
+                        "cantidad": l.get("cantidad", 1), "instrucciones": l.get("instrucciones")})
+        else:
+            raise ApiError(400, "cada línea necesita variante_id o producto_id")
+    if not out:
+        raise ApiError(400, "el pedido no tiene líneas")
+    return out
+
+
+async def crear_pedido(clave: str, lineas: list, entrega: Optional[dict], confirmar: bool = False) -> dict:
+    r = await rpc("api_crear_pedido", {"p_clave": clave, "p_lineas": normaliza_lineas(lineas), "p_entrega": entrega or {}, "p_confirmar": bool(confirmar)})
+    r["total_con_iva"] = eur(r.get("total_cent")); r["subtotal_sin_iva"] = eur(r.get("subtotal_cent"))
+    r["siguiente_paso"] = ("Pedido confirmado: Tecnovinyl lo tiene ya." if r.get("estado") == "confirmado"
+                           else "Pedido pendiente: revisa el total con el cliente y confírmalo con POST /v1/pedidos/{pedido_id}/confirmar (o anúlalo).")
+    return r
+
+
+# ----------------------------------------------------------------------------- FastAPI
+app = FastAPI(title="Tecnovinyl · API de la tienda", version=VERSION,
+              description="API para que los clientes profesionales de Tecnovinyl (y sus agentes de IA) consulten el catálogo, "
+                          "obtengan precios con su tarifa y hagan pedidos. Autenticación: `Authorization: Bearer tv_live_…` "
+                          "(la clave la da Tecnovinyl desde el panel). Los importes van en céntimos de euro, sin IVA salvo que se indique.",
+              docs_url="/docs", redoc_url=None)
+
+
+@app.exception_handler(ApiError)
+async def _api_error(_: Request, e: ApiError):
+    return JSONResponse({"error": e.msg}, status_code=e.status)
+
+
+class LineaPedido(BaseModel):
+    variante_id: Optional[str] = Field(None, description="Combinación concreta (productos con variantes o simples)")
+    producto_id: Optional[str] = Field(None, description="Producto a medida o por tabla (sin variante_id)")
+    cantidad: float = 1
+    seleccion: Optional[dict] = Field(None, description="Opciones elegidas {nombre_opcion: valor} en productos a medida/tabla")
+    ancho_mm: Optional[float] = None
+    alto_mm: Optional[float] = None
+    magnitudes: Optional[dict] = Field(None, description="Magnitudes ya calculadas (avanzado); si no, se calculan de ancho_mm × alto_mm")
+    instrucciones: Optional[str] = None
+
+
+class PedidoIn(BaseModel):
+    lineas: list[LineaPedido]
+    entrega: Optional[dict] = Field(None, description='Ej. {"modo": "recogida"} o {"modo": "envio", "direccion": "…", "observaciones": "…"}')
+    confirmar: bool = Field(False, description="true = confirmar directamente; false = queda pendiente hasta POST /confirmar")
+
+
+class PrecioMedidasIn(BaseModel):
+    producto_id: str
+    seleccion: Optional[dict] = None
+    ancho_mm: Optional[float] = None
+    alto_mm: Optional[float] = None
+    magnitudes: Optional[dict] = None
+    cantidad: int = 1
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def portada():
+    with open(os.path.join(os.path.dirname(__file__), "docs.html"), encoding="utf-8") as f:
+        return f.read().replace("{{API_URL}}", API_URL)
+
+
+@app.get("/llms.txt", response_class=PlainTextResponse, include_in_schema=False)
+async def llms():
+    with open(os.path.join(os.path.dirname(__file__), "llms.txt"), encoding="utf-8") as f:
+        return f.read().replace("{{API_URL}}", API_URL)
+
+
+@app.get("/ping", include_in_schema=False)
+async def ping():
+    return {"ok": True, "version": VERSION}
+
+
+@app.get("/v1/yo", summary="Quién soy (comprueba la clave)")
+async def v_yo(authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await yo(clave_de(authorization, x_api_key))
+
+
+@app.get("/v1/categorias", summary="Categorías del catálogo")
+async def v_categorias():
+    return await categorias()
+
+
+@app.get("/v1/productos", summary="Buscar productos (sin precios)")
+async def v_productos(q: str = Query("", description="texto: nombre, referencia, marca…"), categoria: str = Query("", description="id de categoría"), limite: int = 50):
+    return await buscar(q, categoria, limite)
+
+
+@app.get("/v1/productos/{id_o_slug}", summary="Ficha de un producto: combinaciones y opciones")
+async def v_producto(id_o_slug: str):
+    return await ficha(id_o_slug)
+
+
+@app.get("/v1/precio/variante/{variante_id}", summary="Precio de una combinación con tu tarifa")
+async def v_precio_variante(variante_id: str, cantidad: float = 1, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await precio_variante(clave_de(authorization, x_api_key), variante_id, cantidad)
+
+
+@app.post("/v1/precio/medidas", summary="Precio de un producto a medida o por tabla")
+async def v_precio_medidas(b: PrecioMedidasIn, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await precio_medidas(clave_de(authorization, x_api_key), b.producto_id, b.seleccion or {}, b.ancho_mm, b.alto_mm, b.magnitudes, b.cantidad)
+
+
+@app.get("/v1/pedidos", summary="Mis pedidos")
+async def v_pedidos(limite: int = 50, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await rpc("api_pedidos", {"p_clave": clave_de(authorization, x_api_key), "p_limite": limite})
+
+
+@app.post("/v1/pedidos", summary="Crear un pedido (pendiente de confirmar salvo confirmar=true)")
+async def v_crear_pedido(b: PedidoIn, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await crear_pedido(clave_de(authorization, x_api_key), [l.model_dump() for l in b.lineas], b.entrega, b.confirmar)
+
+
+@app.post("/v1/pedidos/{pedido_id}/confirmar", summary="Confirmar un pedido pendiente")
+async def v_confirmar(pedido_id: str, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await rpc("api_confirmar_pedido", {"p_clave": clave_de(authorization, x_api_key), "p_pedido": pedido_id})
+
+
+@app.post("/v1/pedidos/{pedido_id}/anular", summary="Anular un pedido pendiente (no confirmado)")
+async def v_anular(pedido_id: str, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await rpc("api_cancelar_pedido", {"p_clave": clave_de(authorization, x_api_key), "p_pedido": pedido_id})
+
+
+# ----------------------------------------------------------------------------- MCP
+mcp = FastMCP("Tecnovinyl", instructions=(
+    "Tienda profesional de Tecnovinyl (materiales de rotulación, perfilería, LED, fabricación a medida). "
+    "Trabajas en nombre de un cliente validado. Flujo: buscar_productos → ficha_producto → precio → crear_pedido "
+    "(queda pendiente) → enseñar el total al usuario → confirmar_pedido. Nunca confirmes sin que el usuario lo apruebe. "
+    "Los productos por archivo DXF no se pueden pedir por aquí: indícale al usuario que lo haga en " + TIENDA),
+    stateless_http=True, json_response=True, streamable_http_path="/",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
+
+
+def clave_ctx(ctx: Context) -> str:
+    req = ctx.request_context.request
+    k = None
+    if req is not None:
+        k = (req.scope.get("state") or {}).get("clave") or req.headers.get("x-api-key")
+        if not k:
+            auth = req.headers.get("authorization") or ""
+            m = re.match(r"^\s*Bearer\s+(.+)$", auth, re.I)
+            k = m.group(1).strip() if m else None
+    if not k:
+        raise ApiError(401, "falta la clave de API: usa la URL /mcp/<clave> o la cabecera Authorization")
+    return k
+
+
+@mcp.tool()
+async def quien_soy(ctx: Context) -> dict:
+    """Comprueba la clave y devuelve el cliente en cuyo nombre se trabaja."""
+    return await yo(clave_ctx(ctx))
+
+
+@mcp.tool()
+async def categorias_catalogo() -> list:
+    """Lista las categorías del catálogo con su id (para filtrar búsquedas)."""
+    return await categorias()
+
+
+@mcp.tool()
+async def buscar_productos(texto: str = "", categoria_id: str = "", limite: int = 30) -> list:
+    """Busca productos por texto (nombre, referencia, marca) y/o categoría. Devuelve producto_id, slug, tipo y descripción; sin precios."""
+    return await buscar(texto, categoria_id, limite)
+
+
+@mcp.tool()
+async def ficha_producto(producto: str) -> dict:
+    """Ficha completa de un producto (por producto_id o slug): descripción, atributos, combinaciones (variante_id) y opciones a medida, y cómo se pide según su tipo."""
+    return await ficha(producto)
+
+
+@mcp.tool()
+async def precio_combinacion(ctx: Context, variante_id: str, cantidad: float = 1) -> dict:
+    """Precio con la tarifa del cliente de una combinación concreta (variante_id de la ficha). Importes en céntimos sin IVA."""
+    return await precio_variante(clave_ctx(ctx), variante_id, cantidad)
+
+
+@mcp.tool()
+async def precio_a_medida(ctx: Context, producto_id: str, ancho_mm: float = 0, alto_mm: float = 0, seleccion: Optional[dict] = None, cantidad: int = 1) -> dict:
+    """Precio de un producto a medida (tipo 'medidas') o por tabla (tipo 'tabla'): ancho y alto en mm y las opciones elegidas {nombre: valor}."""
+    return await precio_medidas(clave_ctx(ctx), producto_id, seleccion or {}, ancho_mm, alto_mm, None, cantidad)
+
+
+@mcp.tool()
+async def crear_pedido_pendiente(ctx: Context, lineas: list[dict], entrega: Optional[dict] = None) -> dict:
+    """Crea un pedido PENDIENTE de confirmación. lineas: [{variante_id, cantidad}] o [{producto_id, ancho_mm, alto_mm, seleccion, cantidad}].
+    entrega: {"modo": "recogida"} o {"modo": "envio", "direccion": "...", "observaciones": "..."}. Devuelve el total con IVA: enséñaselo al usuario antes de confirmar."""
+    return await crear_pedido(clave_ctx(ctx), lineas, entrega, False)
+
+
+@mcp.tool()
+async def confirmar_pedido(ctx: Context, pedido_id: str) -> dict:
+    """Confirma un pedido pendiente (solo después de que el usuario haya aprobado el total)."""
+    return await rpc("api_confirmar_pedido", {"p_clave": clave_ctx(ctx), "p_pedido": pedido_id})
+
+
+@mcp.tool()
+async def anular_pedido(ctx: Context, pedido_id: str) -> dict:
+    """Anula un pedido pendiente que aún no se ha confirmado."""
+    return await rpc("api_cancelar_pedido", {"p_clave": clave_ctx(ctx), "p_pedido": pedido_id})
+
+
+@mcp.tool()
+async def mis_pedidos(ctx: Context, limite: int = 20) -> list:
+    """Últimos pedidos del cliente con su estado, líneas e importes."""
+    return await rpc("api_pedidos", {"p_clave": clave_ctx(ctx), "p_limite": limite})
+
+
+_mcp_app = mcp.streamable_http_app()
+
+
+class MCPConClaveEnRuta:
+    """/mcp/<clave> → pasa la clave en scope.state y reenvía al servidor MCP (para clientes que no admiten cabeceras)."""
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            m = re.match(r"^/mcp/(tv_[a-z]+_[0-9a-f]{48})/?$", path)
+            scope = dict(scope)
+            scope["state"] = dict(scope.get("state") or {})
+            if m:
+                scope["state"]["clave"] = m.group(1)
+            scope["path"] = "/"
+            scope["raw_path"] = b"/"
+        return await self.inner(scope, receive, send)
+
+
+app.mount("/mcp", MCPConClaveEnRuta(_mcp_app))
+
+
+@app.on_event("startup")
+async def _arranque():
+    # el session manager de MCP necesita arrancar dentro del bucle de eventos
+    app.state._mcp_cm = mcp.session_manager.run()
+    await app.state._mcp_cm.__aenter__()
+
+
+@app.on_event("shutdown")
+async def _parada():
+    try:
+        await app.state._mcp_cm.__aexit__(None, None, None)
+    except Exception:
+        pass

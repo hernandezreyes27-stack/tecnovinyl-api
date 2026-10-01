@@ -1,0 +1,30 @@
+# Tecnovinyl · tienda profesional y API
+
+> Tecnovinyl S.L.U. (Palma de Mallorca) vende materiales de rotulación e impresión digital (planchas de PVC,
+> metacrilato, composite, vinilos, perfilería de aluminio, iluminación LED, tintas, DTF, accesorios) y
+> fabrica a medida (letras corpóreas, bandejas y rótulos luminosos, neones, planchas cortadas). Solo para
+> profesionales: los precios se ven con una cuenta de cliente validada.
+
+## Para agentes que navegan
+
+- Tienda: https://www.tecnovinyl.com/tienda/ (una sola página; las rutas van tras `#/`: `#/c/<categoría>`,
+  `#/p/<slug-del-producto>`, `#/buscar`, `#/carrito`, `#/entrar`, `#/cuenta`).
+- Hay que entrar con el correo y la contraseña del cliente («Entrar»). Sin entrar se ve el catálogo pero no los precios.
+- En la ficha se eligen las opciones (color, espesor, medida…), la cantidad y «Añadir al carrito»; en los productos a
+  medida se indican ancho y alto; en los de fabricación por archivo se sube un DXF. El carrito se confirma con
+  «Confirmar pedido». El pedido queda en «Mis pedidos».
+- Portes: entrega gratuita con transporte propio en Mallorca (Palma a diario, pueblos martes y jueves); fuera, por agencia.
+- Pago: según las condiciones del cliente (transferencia o crédito). No hay pago con tarjeta en la web.
+
+## Para agentes que se conectan por API
+
+- Documentación: {{API_URL}}/ · OpenAPI: {{API_URL}}/openapi.json · Swagger: {{API_URL}}/docs
+- Autenticación: cabecera `Authorization: Bearer tv_live_…` (la clave la entrega Tecnovinyl al cliente desde su panel).
+- Servidor MCP (Claude, ChatGPT y otros): `{{API_URL}}/mcp/<clave>` (streamable HTTP) o `{{API_URL}}/mcp` con la cabecera Authorization.
+- Flujo: GET /v1/productos?q= → GET /v1/productos/{slug} → GET /v1/precio/variante/{variante_id} o POST /v1/precio/medidas
+  → POST /v1/pedidos (queda pendiente) → POST /v1/pedidos/{id}/confirmar. Importes en céntimos, sin IVA salvo total_cent del pedido.
+- Los productos por archivo DXF no se pueden pedir por API (solo consultar): se piden desde la tienda subiendo el archivo.
+
+## Contacto
+
+Tecnovinyl S.L.U. · Gremi de Porgadors 12, Son Castelló, 07009 Palma · 971 431 549 · lunes a viernes 08:00–16:00.

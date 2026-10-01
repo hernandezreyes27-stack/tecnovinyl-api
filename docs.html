@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>API de la tienda · Tecnovinyl</title>
+<meta name="description" content="API y servidor MCP de la tienda profesional de Tecnovinyl: catálogo, precios con tu tarifa y pedidos, para tu software o tu agente de IA.">
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:light;--red:#e10a17;--text:#111;--muted:#6b6b6b;--border:#e6e6e6;--bg:#fff;--soft:#f6f6f6}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,sans-serif;color:var(--text);background:var(--bg);line-height:1.6}
+.wrap{max-width:920px;margin:0 auto;padding:28px 20px 60px}
+header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-bottom:18px;border-bottom:1px solid var(--border)}
+.logo{font-weight:800;font-style:italic;color:var(--red);font-size:22px;letter-spacing:-.5px;text-decoration:none}
+nav a{color:var(--text);text-decoration:none;margin-left:16px;font-size:14px}nav a:hover{color:var(--red)}
+h1{font-size:30px;line-height:1.2;margin:28px 0 8px;letter-spacing:-.5px}h2{font-size:20px;margin:36px 0 10px}h3{font-size:15px;margin:22px 0 6px}
+p{margin:8px 0}.lead{font-size:17px;color:#333}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;background:var(--soft);padding:2px 6px;border-radius:6px}
+pre{background:#0f0f0f;color:#f2f2f2;padding:14px 16px;border-radius:12px;overflow:auto;font-size:13px;line-height:1.5}pre code{background:none;padding:0;color:inherit}
+table{width:100%;border-collapse:collapse;font-size:14px;margin:10px 0}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border);vertical-align:top}th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+.m{font-family:ui-monospace,Menlo,monospace;font-size:12.5px;white-space:nowrap}
+.card{border:1px solid var(--border);border-radius:14px;padding:16px 18px;margin:14px 0;background:#fff}
+.btn{display:inline-block;background:var(--red);color:#fff;text-decoration:none;padding:9px 16px;border-radius:999px;font-weight:600;font-size:14px}
+.btn.o{background:#fff;color:var(--text);border:1px solid var(--border)}
+.note{color:var(--muted);font-size:13.5px}
+footer{margin-top:50px;padding-top:16px;border-top:1px solid var(--border);color:var(--muted);font-size:13px}
+</style>
+</head>
+<body><div class="wrap">
+<header><a class="logo" href="https://www.tecnovinyl.com/tienda/">TECNOVINYL</a><nav><a href="/docs">Swagger</a><a href="/openapi.json">OpenAPI</a><a href="/llms.txt">llms.txt</a><a href="https://www.tecnovinyl.com/tienda/">Tienda</a></nav></header>
+
+<h1>API de la tienda</h1>
+<p class="lead">Para que tu software o tu agente de IA consulte el catálogo, obtenga precios con tu tarifa y haga pedidos en Tecnovinyl, sin pasar por la web.</p>
+<p><a class="btn" href="/docs">Probar los endpoints</a> &nbsp; <a class="btn o" href="#mcp">Conectar un agente (MCP)</a></p>
+
+<h2>Cómo empezar</h2>
+<div class="card">
+<p><b>1. Pide tu clave.</b> Hace falta ser cliente validado de Tecnovinyl. Te la damos desde nuestro panel y empieza por <code>tv_live_</code>. Se muestra una sola vez: guárdala en un sitio seguro. Puedes pedir varias (una por programa o agente) y anular cualquiera cuando quieras.</p>
+<p><b>2. Mándala en cada petición</b> con la cabecera <code>Authorization: Bearer tv_live_…</code> (o <code>X-API-Key</code>).</p>
+<p><b>3. Flujo normal:</b> buscar → ficha → precio → crear pedido (queda pendiente) → confirmar.</p>
+</div>
+
+<h2>Endpoints</h2>
+<p class="note">Base: <code>{{API_URL}}</code>. Respuestas en JSON. Importes en <b>céntimos de euro, sin IVA</b> salvo <code>total_cent</code> de los pedidos, que lleva el IVA.</p>
+<table>
+<tr><th>Método</th><th>Ruta</th><th>Qué hace</th></tr>
+<tr><td class="m">GET</td><td class="m">/v1/yo</td><td>Comprueba la clave y devuelve el cliente.</td></tr>
+<tr><td class="m">GET</td><td class="m">/v1/categorias</td><td>Categorías con su id y número de productos.</td></tr>
+<tr><td class="m">GET</td><td class="m">/v1/productos?q=&amp;categoria=</td><td>Busca productos por texto (nombre, referencia, marca) y/o categoría. Sin precios.</td></tr>
+<tr><td class="m">GET</td><td class="m">/v1/productos/{slug}</td><td>Ficha: descripción, atributos, <b>combinaciones</b> (cada una con su <code>variante_id</code>), opciones a medida y cómo se pide según el tipo.</td></tr>
+<tr><td class="m">GET</td><td class="m">/v1/precio/variante/{variante_id}?cantidad=</td><td>Precio con tu tarifa de una combinación.</td></tr>
+<tr><td class="m">POST</td><td class="m">/v1/precio/medidas</td><td>Precio de un producto a medida (<code>ancho_mm</code>, <code>alto_mm</code>, <code>seleccion</code>) o por tabla.</td></tr>
+<tr><td class="m">GET</td><td class="m">/v1/pedidos</td><td>Tus pedidos con estado, líneas e importes.</td></tr>
+<tr><td class="m">POST</td><td class="m">/v1/pedidos</td><td>Crea un pedido. Por defecto queda <b>pendiente de confirmación</b>; con <code>"confirmar": true</code> se confirma en el acto.</td></tr>
+<tr><td class="m">POST</td><td class="m">/v1/pedidos/{id}/confirmar</td><td>Confirma un pedido pendiente.</td></tr>
+<tr><td class="m">POST</td><td class="m">/v1/pedidos/{id}/anular</td><td>Anula un pedido pendiente (los confirmados, por teléfono).</td></tr>
+</table>
+
+<h3>Ejemplo: 3 planchas de PVC de 5 mm</h3>
+<pre><code># 1. buscar
+curl "{{API_URL}}/v1/productos?q=pvc%20espumado%20blanco"
+# 2. ficha → combinaciones → variante_id de "5 mm · Plancha entera"
+curl "{{API_URL}}/v1/productos/pvc-espumado-blanco-plancha-393"
+# 3. precio con tu tarifa
+curl -H "Authorization: Bearer tv_live_…" "{{API_URL}}/v1/precio/variante/947b4b76-…?cantidad=3"
+# 4. pedido (pendiente)
+curl -X POST -H "Authorization: Bearer tv_live_…" -H "Content-Type: application/json" \
+  -d '{"lineas":[{"variante_id":"947b4b76-…","cantidad":3}],"entrega":{"modo":"recogida"}}' \
+  "{{API_URL}}/v1/pedidos"
+# 5. confirmar con el total a la vista
+curl -X POST -H "Authorization: Bearer tv_live_…" "{{API_URL}}/v1/pedidos/64f1c2d4-…/confirmar"</code></pre>
+
+<h3>Ejemplo: recorte de metacrilato a medida</h3>
+<pre><code>curl -X POST -H "Authorization: Bearer tv_live_…" -H "Content-Type: application/json" \
+  -d '{"producto_id":"&lt;producto_id de Metacrilato Incoloro (recortes)&gt;","ancho_mm":600,"alto_mm":400,"seleccion":{"Espesor":"3 mm"},"cantidad":2}' \
+  "{{API_URL}}/v1/precio/medidas"</code></pre>
+<p class="note">Las opciones (<code>seleccion</code>) se escriben con el nombre y el valor exactos que devuelve la ficha en <code>opciones</code>. Lo que no se indica va con el valor por defecto.</p>
+
+<h2 id="mcp">Conectar un agente de IA (MCP)</h2>
+<div class="card">
+<p>La API también es un <b>servidor MCP</b>, el estándar con el que Claude, ChatGPT y otros asistentes usan herramientas. Dale a tu asistente esta dirección como conector o servidor MCP remoto (transporte <i>streamable HTTP</i>):</p>
+<pre><code>{{API_URL}}/mcp/tv_live_…</code></pre>
+<p>Si tu cliente MCP admite cabeceras, puedes usar <code>{{API_URL}}/mcp</code> con <code>Authorization: Bearer tv_live_…</code>.</p>
+<p>Herramientas: <code>quien_soy</code>, <code>categorias_catalogo</code>, <code>buscar_productos</code>, <code>ficha_producto</code>, <code>precio_combinacion</code>, <code>precio_a_medida</code>, <code>crear_pedido_pendiente</code>, <code>confirmar_pedido</code>, <code>anular_pedido</code>, <code>mis_pedidos</code>.</p>
+<p>Ejemplo de uso: «<i>Pídele a Tecnovinyl 3 planchas de PVC blanco de 5 mm y 2 recortes de metacrilato de 3 mm de 600 × 400, para recoger</i>». El agente busca, calcula el precio, crea el pedido pendiente, te enseña el total y, cuando le dices que sí, lo confirma.</p>
+<p class="note">La clave va en la URL: trátala como una contraseña y no la compartas. Si se filtra, pide una nueva y anulamos la anterior.</p>
+</div>
+
+<h2>Lo que conviene saber</h2>
+<table>
+<tr><th>Tema</th><th>Detalle</th></tr>
+<tr><td>Tipos de producto</td><td><code>variantes</code> y <code>simple</code>: se piden por <code>variante_id</code>. <code>medidas</code> y <code>tabla</code>: por <code>producto_id</code> + medidas/opciones. <code>dxf</code>: solo consulta; el pedido se hace en la tienda subiendo el archivo.</td></tr>
+<tr><td>Pedidos pendientes</td><td>Un pedido creado sin <code>confirmar</code> no llega al taller hasta que se confirma. Así el agente puede enseñar el total antes de comprometer la compra. Se puede anular.</td></tr>
+<tr><td>Precios</td><td>Son los de tu tarifa, los mismos que ves en la tienda. El servidor los recalcula al crear el pedido: lo que mande el agente no cambia el precio.</td></tr>
+<tr><td>Entrega</td><td><code>{"modo":"recogida"}</code> o <code>{"modo":"envio","direccion":"…","observaciones":"…"}</code>. En Mallorca el reparto es gratuito (Palma a diario, pueblos martes y jueves).</td></tr>
+<tr><td>Errores</td><td>JSON <code>{"error": "…"}</code> con 401 (clave), 400 (datos) o 404 (no existe).</td></tr>
+<tr><td>Límites</td><td>Uso razonable; hasta 200 líneas por pedido. Si vas a hacer miles de llamadas al día, avísanos.</td></tr>
+</table>
+
+<footer>Tecnovinyl S.L.U. · Gremi de Porgadors 12, Son Castelló, 07009 Palma · 971 431 549 · <a href="https://www.tecnovinyl.com/tienda/#/legal/condiciones">Condiciones de contratación</a></footer>
+</div></body></html>
