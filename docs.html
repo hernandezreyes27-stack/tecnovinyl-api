@@ -50,6 +50,8 @@ footer{margin-top:50px;padding-top:16px;border-top:1px solid var(--border);color
 <tr><td class="m">GET</td><td class="m">/v1/productos/{slug}</td><td>Ficha: descripción, atributos, <b>combinaciones</b> (cada una con su <code>variante_id</code>), opciones a medida y cómo se pide según el tipo.</td></tr>
 <tr><td class="m">GET</td><td class="m">/v1/precio/variante/{variante_id}?cantidad=</td><td>Precio con tu tarifa de una combinación.</td></tr>
 <tr><td class="m">POST</td><td class="m">/v1/precio/medidas</td><td>Precio de un producto a medida (<code>ancho_mm</code>, <code>alto_mm</code>, <code>seleccion</code>) o por tabla.</td></tr>
+<tr><td class="m">POST</td><td class="m">/v1/precio/bandeja-ciega</td><td>Precio de una <b>bandeja ciega de composite</b> a medida (<code>ancho_mm</code>, <code>alto_mm</code>, <code>fondo_mm</code>, <code>color</code>, <code>esquinas</code>, <code>trasera</code>, <code>acabado</code>, <code>cantidad</code>).</td></tr>
+<tr><td class="m">POST</td><td class="m">/v1/precio/bandejas-esquina</td><td>Despiece y precio de un <b>rótulo de bandejas en fachada con esquinas</b> (<code>tramos_mm</code>, <code>esquinas</code>, <code>alto_mm</code>, <code>fondo_mm</code>, <code>color</code>).</td></tr>
 <tr><td class="m">GET</td><td class="m">/v1/pedidos</td><td>Tus pedidos con estado, líneas e importes.</td></tr>
 <tr><td class="m">POST</td><td class="m">/v1/pedidos</td><td>Crea un pedido. Por defecto queda <b>pendiente de confirmación</b>; con <code>"confirmar": true</code> se confirma en el acto.</td></tr>
 <tr><td class="m">POST</td><td class="m">/v1/pedidos/{id}/confirmar</td><td>Confirma un pedido pendiente.</td></tr>
@@ -76,12 +78,21 @@ curl -X POST -H "Authorization: Bearer tv_live_…" "{{API_URL}}/v1/pedidos/64f1
   "{{API_URL}}/v1/precio/medidas"</code></pre>
 <p class="note">Las opciones (<code>seleccion</code>) se escriben con el nombre y el valor exactos que devuelve la ficha en <code>opciones</code>. Lo que no se indica va con el valor por defecto.</p>
 
+<h3>Ejemplo: rótulo de bandejas en una esquina</h3>
+<pre><code># fachada de 8 m + 10 m con una esquina normal (90°), rótulo de 800 mm de alto y 60 de fondo, negro mate
+curl -X POST -H "Authorization: Bearer tv_live_…" -H "Content-Type: application/json" \
+  -d '{"tramos_mm":[8000,10000],"esquinas":[{"tipo":"saliente","angulo":90}],"alto_mm":800,"fondo_mm":60,"color":"negro-mate"}' \
+  "{{API_URL}}/v1/precio/bandejas-esquina"
+# → despiece (bandejas y pliegues), precio sin IVA y "linea_para_pedido", que se pasa tal cual en POST /v1/pedidos:
+#   {"lineas":[{"bandejas_esquina":{…},"cantidad":1}]}</code></pre>
+<p class="note">Bandejas: el precio es el mismo cálculo por costes que en la tienda. El color hay que indicarlo siempre. Si la bandeja abierta no cabe en la plancha de 1500 (juntas) o el reparto no es posible, la API lo dice y hay que pedirla como presupuesto en la tienda. La bandeja calada necesita tu DXF: se pide en la tienda.</p>
+
 <h2 id="mcp">Conectar un agente de IA (MCP)</h2>
 <div class="card">
 <p>La API también es un <b>servidor MCP</b>, el estándar con el que Claude, ChatGPT y otros asistentes usan herramientas. Dale a tu asistente esta dirección como conector o servidor MCP remoto (transporte <i>streamable HTTP</i>):</p>
 <pre><code>{{API_URL}}/mcp/tv_live_…</code></pre>
 <p>Si tu cliente MCP admite cabeceras, puedes usar <code>{{API_URL}}/mcp</code> con <code>Authorization: Bearer tv_live_…</code>.</p>
-<p>Herramientas: <code>quien_soy</code>, <code>categorias_catalogo</code>, <code>buscar_productos</code>, <code>ficha_producto</code>, <code>precio_combinacion</code>, <code>precio_a_medida</code>, <code>crear_pedido_pendiente</code>, <code>confirmar_pedido</code>, <code>anular_pedido</code>, <code>mis_pedidos</code>.</p>
+<p>Herramientas: <code>quien_soy</code>, <code>categorias_catalogo</code>, <code>buscar_productos</code>, <code>ficha_producto</code>, <code>precio_combinacion</code>, <code>precio_a_medida</code>, <code>precio_bandeja_ciega</code>, <code>precio_bandejas_esquina</code>, <code>crear_pedido_pendiente</code>, <code>confirmar_pedido</code>, <code>anular_pedido</code>, <code>mis_pedidos</code>.</p>
 <p>Ejemplo de uso: «<i>Pídele a Tecnovinyl 3 planchas de PVC blanco de 5 mm y 2 recortes de metacrilato de 3 mm de 600 × 400, para recoger</i>». El agente busca, calcula el precio, crea el pedido pendiente, te enseña el total y, cuando le dices que sí, lo confirma.</p>
 <p class="note">La clave va en la URL: trátala como una contraseña y no la compartas. Si se filtra, pide una nueva y anulamos la anterior.</p>
 </div>
@@ -89,7 +100,7 @@ curl -X POST -H "Authorization: Bearer tv_live_…" "{{API_URL}}/v1/pedidos/64f1
 <h2>Lo que conviene saber</h2>
 <table>
 <tr><th>Tema</th><th>Detalle</th></tr>
-<tr><td>Tipos de producto</td><td><code>variantes</code> y <code>simple</code>: se piden por <code>variante_id</code>. <code>medidas</code> y <code>tabla</code>: por <code>producto_id</code> + medidas/opciones. <code>dxf</code>: solo consulta; el pedido se hace en la tienda subiendo el archivo.</td></tr>
+<tr><td>Tipos de producto</td><td><code>variantes</code> y <code>simple</code>: se piden por <code>variante_id</code>. <code>medidas</code> y <code>tabla</code>: por <code>producto_id</code> + medidas/opciones. <code>bandeja_ciega</code> y <code>bandejas_esquina</code>: con sus endpoints de precio y una línea <code>{"bandeja_ciega": {…}}</code> o <code>{"bandejas_esquina": {…}}</code>. <code>dxf</code> (letras, neón, bandeja calada…): solo consulta; el pedido se hace en la tienda subiendo el archivo.</td></tr>
 <tr><td>Pedidos pendientes</td><td>Un pedido creado sin <code>confirmar</code> no llega al taller hasta que se confirma. Así el agente puede enseñar el total antes de comprometer la compra. Se puede anular.</td></tr>
 <tr><td>Precios</td><td>Son los de tu tarifa, los mismos que ves en la tienda. El servidor los recalcula al crear el pedido: lo que mande el agente no cambia el precio.</td></tr>
 <tr><td>Entrega</td><td><code>{"modo":"recogida"}</code> o <code>{"modo":"envio","direccion":"…","observaciones":"…"}</code>. En Mallorca el reparto es gratuito (Palma a diario, pueblos martes y jueves).</td></tr>

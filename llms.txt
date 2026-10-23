@@ -23,7 +23,10 @@
 - Servidor MCP (Claude, ChatGPT y otros): `{{API_URL}}/mcp/<clave>` (streamable HTTP) o `{{API_URL}}/mcp` con la cabecera Authorization.
 - Flujo: GET /v1/productos?q= → GET /v1/productos/{slug} → GET /v1/precio/variante/{variante_id} o POST /v1/precio/medidas
   → POST /v1/pedidos (queda pendiente) → POST /v1/pedidos/{id}/confirmar. Importes en céntimos, sin IVA salvo total_cent del pedido.
-- Los productos por archivo DXF no se pueden pedir por API (solo consultar): se piden desde la tienda subiendo el archivo.
+- Bandejas de composite: POST /v1/precio/bandeja-ciega y POST /v1/precio/bandejas-esquina (fachada con esquinas: tramos y
+  ángulos → despiece y precio). Devuelven `linea_para_pedido` para POST /v1/pedidos. Pregunta siempre el color.
+- Los productos por archivo DXF (letras, neón, bandeja calada) no se pueden pedir por API (solo consultar): se piden desde
+  la tienda subiendo el archivo.
 
 ## Contacto
 

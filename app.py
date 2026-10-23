@@ -16,12 +16,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
+import bandejas as BJ
 
 SB = os.environ.get("SUPABASE_URL", "https://vqfcfbqlycjgqmdfympr.supabase.co").rstrip("/")
 KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 TIENDA = "https://www.tecnovinyl.com/tienda/"
 API_URL = os.environ.get("API_URL", "https://api.tecnovinyl.com")
-VERSION = "1.0"
+VERSION = "1.1"
 
 if not KEY:
     print("AVISO: falta SUPABASE_SERVICE_KEY; las llamadas a la base de datos fallarán")
@@ -133,6 +134,13 @@ async def buscar(q: str = "", categoria: str = "", limite: int = 50) -> list:
         # primero los que llevan todas las palabras en el nombre, luego por nombre
         sel.sort(key=lambda p: (0 if all(w in norm(p["nombre"]) for w in t) else 1, norm(p["nombre"])))
     out = []
+    # bandejas de composite (23/10/2026): en la tienda son configuradores, aquí productos virtuales
+    for v in BJ.VIRTUALES:
+        if categoria and v["categoria_id"] not in descendientes(cats, categoria):
+            continue
+        if q and not all(w in norm(v["nombre"] + " " + v["descripcion_corta"] + " " + v["categoria"]) for w in norm(q).split()):
+            continue
+        out.append(dict(v))
     for p in sel[:max(1, min(limite, 200))]:
         out.append({"producto_id": p["id"], "slug": p["slug"], "nombre": p["nombre"], "tipo": p["tipo"],
                     "categoria": nombre_cat.get(p["categoria_id"]), "categoria_id": p["categoria_id"],
@@ -149,6 +157,9 @@ TIPOS = {"variantes": "Producto con combinaciones (color, medida…): pide el pr
 
 
 async def ficha(id_o_slug: str) -> dict:
+    v = BJ.es_virtual(id_o_slug)
+    if v:
+        return BJ.ficha_virtual(v)
     filtro = {"id": "eq." + id_o_slug} if re.match(r"^[0-9a-f-]{36}$", id_o_slug) else {"slug": "eq." + id_o_slug}
     r = await rest("/productos_publicos", dict(filtro, **{
         "select": "id,slug,nombre,tipo,categoria_id,marca,descripcion_corta,descripcion,unidad_venta,limites,plazo,bajo_pedido,"
@@ -224,18 +235,51 @@ async def precio_medidas(clave: str, producto_id: str, seleccion: dict, ancho_mm
     return r
 
 
+def _conf(fn, d):
+    try:
+        return fn(d)
+    except BJ.ErrorBandeja as e:
+        raise ApiError(400, str(e))
+
+
+async def precio_bandeja(clave: str, tipo: str, d: dict) -> dict:
+    conf = _conf(BJ.conf_ciega if tipo == "ciega" else BJ.conf_esquina, d)
+    r = await rpc("api_precio_bandeja", {"p_clave": clave, "p_tipo": tipo, "p": conf})
+    if r.get("error"):
+        raise ApiError(400, r["error"] + (" Hay que estudiarla con Tecnovinyl: pídela como presupuesto en la tienda." if r.get("juntas") else ""))
+    out = {"precio_cent": r.get("precio_cent"), "pvp_cent": r.get("pvp_cent"), "descuento_pct": round(float(r.get("dto") or 0) * 100),
+           "unitario_cent": r.get("unitario_cent"), "cantidad": r.get("q"),
+           "precio": eur(r.get("precio_cent")) + " + IVA", "pvp_tachado": eur(r.get("pvp_cent"))}
+    if tipo == "ciega":
+        out["piezas"] = r.get("n")
+        if (r.get("n") or 1) > 1:
+            out["nota"] = f"Por su largo va en {r['n']} piezas de {r['lp']} × {r['c']} mm a tope sobre una sola estructura."
+    else:
+        out.update({"desarrollo_mm": conf["desarrollo"], "bandejas": len(conf["piezas"]), "despiece": BJ.despiece_legible(conf),
+                    "nota": "Una sola estructura de aluminio en todo el desarrollo, con inglete en las esquinas."})
+    out["linea_para_pedido"] = {("bandeja_ciega" if tipo == "ciega" else "bandejas_esquina"): d,
+                                "cantidad": (conf.get("q") or 1)}
+    return out
+
+
 def normaliza_lineas(lineas: list) -> list:
     out = []
     for l in lineas or []:
         l = dict(l)
-        if l.get("variante_id"):
+        if l.get("bandeja_ciega"):
+            conf = _conf(BJ.conf_ciega, dict(l["bandeja_ciega"], cantidad=l.get("cantidad") or l["bandeja_ciega"].get("cantidad") or 1))
+            out.append({"producto_id": None, "cantidad": conf["q"], "bandeja_ciega": conf})
+        elif l.get("bandejas_esquina") or l.get("bandeja_esquina"):
+            conf = _conf(BJ.conf_esquina, l.get("bandejas_esquina") or l.get("bandeja_esquina"))
+            out.append({"producto_id": None, "cantidad": 1, "bandeja_esquina": conf})
+        elif l.get("variante_id"):
             out.append({"variante_id": l["variante_id"], "cantidad": l.get("cantidad", 1), "instrucciones": l.get("instrucciones")})
         elif l.get("producto_id"):
             mags = l.get("magnitudes") or magnitudes_de(l.get("ancho_mm"), l.get("alto_mm"))
             out.append({"producto_id": l["producto_id"], "seleccion": l.get("seleccion") or {}, "magnitudes": mags,
                         "cantidad": l.get("cantidad", 1), "instrucciones": l.get("instrucciones")})
         else:
-            raise ApiError(400, "cada línea necesita variante_id o producto_id")
+            raise ApiError(400, "cada línea necesita variante_id, producto_id, bandeja_ciega o bandejas_esquina")
     if not out:
         raise ApiError(400, "el pedido no tiene líneas")
     return out
@@ -271,6 +315,36 @@ class LineaPedido(BaseModel):
     alto_mm: Optional[float] = None
     magnitudes: Optional[dict] = Field(None, description="Magnitudes ya calculadas (avanzado); si no, se calculan de ancho_mm × alto_mm")
     instrucciones: Optional[str] = None
+    bandeja_ciega: Optional[dict] = Field(None, description="Bandeja ciega: los mismos parámetros que /v1/precio/bandeja-ciega")
+    bandejas_esquina: Optional[dict] = Field(None, description="Bandejas en esquina: los mismos parámetros que /v1/precio/bandejas-esquina")
+
+
+class BandejaCiegaIn(BaseModel):
+    ancho_mm: float = Field(..., description="Ancho exterior en mm (mín. 300)")
+    alto_mm: float = Field(..., description="Alto exterior en mm (mín. 300)")
+    fondo_mm: float = Field(..., description="Fondo o canto en mm (20–300)")
+    color: str = Field(..., description="negro-mate | negro-brillo | blanco-mate | blanco-brillo")
+    esquinas: str = Field("v", description="v (en V) | recta")
+    trasera: str = Field("sin", description="sin | estructura | contra")
+    acabado: str = Field("natural", description="natural | ral")
+    ral: Optional[str] = None
+    observaciones: Optional[str] = None
+    cantidad: int = 1
+
+
+class EsquinaIn(BaseModel):
+    tipo: str = Field("saliente", description="saliente (hacia la calle) | entrante (rincón)")
+    angulo: float = Field(90, description="Ángulo entre las dos paredes en grados; 90 = esquina normal")
+
+
+class BandejasEsquinaIn(BaseModel):
+    tramos_mm: list[float] = Field(..., description="Largo de cada tramo de fachada, en orden")
+    esquinas: list[EsquinaIn] = Field(default_factory=list, description="Una menos que tramos")
+    alto_mm: float = Field(..., description="Alto del rótulo (200–1500)")
+    fondo_mm: float = Field(..., description="Fondo o canto (20–300)")
+    color: str = Field(..., description="negro-mate | negro-brillo | blanco-mate | blanco-brillo")
+    medidas_de: str = Field("pared", description="pared | rotulo")
+    observaciones: Optional[str] = None
 
 
 class PedidoIn(BaseModel):
@@ -335,6 +409,16 @@ async def v_precio_medidas(b: PrecioMedidasIn, authorization: Optional[str] = He
     return await precio_medidas(clave_de(authorization, x_api_key), b.producto_id, b.seleccion or {}, b.ancho_mm, b.alto_mm, b.magnitudes, b.cantidad)
 
 
+@app.post("/v1/precio/bandeja-ciega", summary="Precio de una bandeja ciega de composite a medida")
+async def v_precio_ciega(b: BandejaCiegaIn, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await precio_bandeja(clave_de(authorization, x_api_key), "ciega", b.model_dump())
+
+
+@app.post("/v1/precio/bandejas-esquina", summary="Despiece y precio de un rótulo de bandejas en fachada con esquinas")
+async def v_precio_esquina(b: BandejasEsquinaIn, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await precio_bandeja(clave_de(authorization, x_api_key), "esquina", b.model_dump())
+
+
 @app.get("/v1/pedidos", summary="Mis pedidos")
 async def v_pedidos(limite: int = 50, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
     return await rpc("api_pedidos", {"p_clave": clave_de(authorization, x_api_key), "p_limite": limite})
@@ -342,7 +426,7 @@ async def v_pedidos(limite: int = 50, authorization: Optional[str] = Header(None
 
 @app.post("/v1/pedidos", summary="Crear un pedido (pendiente de confirmar salvo confirmar=true)")
 async def v_crear_pedido(b: PedidoIn, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
-    return await crear_pedido(clave_de(authorization, x_api_key), [l.model_dump() for l in b.lineas], b.entrega, b.confirmar)
+    return await crear_pedido(clave_de(authorization, x_api_key), [l.model_dump(exclude_none=True) for l in b.lineas], b.entrega, b.confirmar)
 
 
 @app.post("/v1/pedidos/{pedido_id}/confirmar", summary="Confirmar un pedido pendiente")
@@ -360,7 +444,9 @@ mcp = FastMCP("Tecnovinyl", instructions=(
     "Tienda profesional de Tecnovinyl (materiales de rotulación, perfilería, LED, fabricación a medida). "
     "Trabajas en nombre de un cliente validado. Flujo: buscar_productos → ficha_producto → precio → crear_pedido "
     "(queda pendiente) → enseñar el total al usuario → confirmar_pedido. Nunca confirmes sin que el usuario lo apruebe. "
-    "Los productos por archivo DXF no se pueden pedir por aquí: indícale al usuario que lo haga en " + TIENDA),
+    "Bandejas de composite: precio_bandeja_ciega y precio_bandejas_esquina dan el precio (y el despiece) y la línea lista para el pedido; "
+    "pregunta siempre el color, no lo supongas. "
+    "Los productos por archivo DXF (letras, neón, bandeja calada…) no se pueden pedir por aquí: indícale al usuario que lo haga en " + TIENDA),
     stateless_http=True, json_response=True, streamable_http_path="/",
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
 
@@ -416,8 +502,31 @@ async def precio_a_medida(ctx: Context, producto_id: str, ancho_mm: float = 0, a
 
 
 @mcp.tool()
+async def precio_bandeja_ciega(ctx: Context, ancho_mm: float, alto_mm: float, fondo_mm: float, color: str, esquinas: str = "v",
+                               trasera: str = "sin", acabado: str = "natural", ral: str = "", observaciones: str = "", cantidad: int = 1) -> dict:
+    """Precio de una bandeja ciega de composite de 3 mm a medida (cálculo por costes de Tecnovinyl).
+    color: negro-mate | negro-brillo | blanco-mate | blanco-brillo (pregúntalo). esquinas: v | recta.
+    trasera: sin | estructura (aluminio) | contra (contrabandeja). acabado: natural | ral (con ral).
+    Devuelve el precio sin IVA y linea_para_pedido, que se pasa tal cual a crear_pedido_pendiente."""
+    return await precio_bandeja(clave_ctx(ctx), "ciega", dict(ancho_mm=ancho_mm, alto_mm=alto_mm, fondo_mm=fondo_mm, color=color, esquinas=esquinas,
+                                trasera=trasera, acabado=acabado, ral=ral, observaciones=observaciones, cantidad=cantidad))
+
+
+@mcp.tool()
+async def precio_bandejas_esquina(ctx: Context, tramos_mm: list[float], esquinas: list[dict], alto_mm: float, fondo_mm: float, color: str,
+                                  medidas_de: str = "pared", observaciones: str = "") -> dict:
+    """Despiece y precio de un rótulo de bandejas de composite en una fachada con esquinas, sobre estructura de aluminio con inglete.
+    tramos_mm: largo de cada tramo en orden. esquinas: una menos que tramos, [{"tipo": "saliente"|"entrante", "angulo": 90}]
+    (ángulo entre las dos paredes). medidas_de: pared | rotulo. color: negro-mate | negro-brillo | blanco-mate | blanco-brillo (pregúntalo).
+    Devuelve el despiece (bandejas y pliegues), el precio sin IVA y linea_para_pedido para crear_pedido_pendiente."""
+    return await precio_bandeja(clave_ctx(ctx), "esquina", dict(tramos_mm=tramos_mm, esquinas=esquinas, alto_mm=alto_mm, fondo_mm=fondo_mm,
+                                color=color, medidas_de=medidas_de, observaciones=observaciones))
+
+
+@mcp.tool()
 async def crear_pedido_pendiente(ctx: Context, lineas: list[dict], entrega: Optional[dict] = None) -> dict:
-    """Crea un pedido PENDIENTE de confirmación. lineas: [{variante_id, cantidad}] o [{producto_id, ancho_mm, alto_mm, seleccion, cantidad}].
+    """Crea un pedido PENDIENTE de confirmación. lineas: [{variante_id, cantidad}], [{producto_id, ancho_mm, alto_mm, seleccion, cantidad}]
+    o la linea_para_pedido de precio_bandeja_ciega / precio_bandejas_esquina.
     entrega: {"modo": "recogida"} o {"modo": "envio", "direccion": "...", "observaciones": "..."}. Devuelve el total con IVA: enséñaselo al usuario antes de confirmar."""
     return await crear_pedido(clave_ctx(ctx), lineas, entrega, False)
 
