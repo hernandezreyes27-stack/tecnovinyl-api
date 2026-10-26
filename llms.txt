@@ -25,6 +25,8 @@
   → POST /v1/pedidos (queda pendiente) → POST /v1/pedidos/{id}/confirmar. Importes en céntimos, sin IVA salvo total_cent del pedido.
 - Bandejas de composite: POST /v1/precio/bandeja-ciega y POST /v1/precio/bandejas-esquina (fachada con esquinas: tramos y
   ángulos → despiece y precio). Devuelven `linea_para_pedido` para POST /v1/pedidos. Pregunta siempre el color.
+- Letras corpóreas y neón (solo precio, mismo cálculo por costes que la tienda): POST /v1/precio/letras (tipo, texto + alto_mm
+  = orientativo, o piezas del DXF = exacto; opciones en GET /v1/precio/letras/opciones) y POST /v1/precio/neon.
 - Los productos por archivo DXF (letras, neón, bandeja calada) no se pueden pedir por API (solo consultar): se piden desde
   la tienda subiendo el archivo.
 

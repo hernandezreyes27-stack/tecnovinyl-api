@@ -17,12 +17,13 @@ from pydantic import BaseModel, Field
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
 import bandejas as BJ
+import fabricados as FB
 
 SB = os.environ.get("SUPABASE_URL", "https://vqfcfbqlycjgqmdfympr.supabase.co").rstrip("/")
 KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 TIENDA = "https://www.tecnovinyl.com/tienda/"
 API_URL = os.environ.get("API_URL", "https://api.tecnovinyl.com")
-VERSION = "1.1"
+VERSION = "1.2"
 
 if not KEY:
     print("AVISO: falta SUPABASE_SERVICE_KEY; las llamadas a la base de datos fallarán")
@@ -262,6 +263,30 @@ async def precio_bandeja(clave: str, tipo: str, d: dict) -> dict:
     return out
 
 
+async def precio_fabricado(clave: str, tipo: str, d: dict) -> dict:
+    """Letras corpóreas y neón por costes (26/10/2026): mismo cálculo que la tienda; solo precio."""
+    if tipo not in FB.TIPOS:
+        raise ApiError(400, "tipo no válido: " + ", ".join(FB.TIPOS))
+    try:
+        conf, estimado = FB.conf(tipo, d)
+    except FB.ErrorFab as e:
+        raise ApiError(400, str(e))
+    r = await rpc("api_precio_fabricado", {"p_clave": clave, "p_tipo": tipo, "p": conf})
+    if r.get("error"):
+        raise ApiError(400, r["error"])
+    precio_keys = {"precio_cent", "pvp_cent", "unitario_cent", "pvp_unitario_cent", "dto", "q"}
+    out = {"producto": FB.TIPOS[tipo][1], "precio_cent": r.get("precio_cent"), "pvp_cent": r.get("pvp_cent"),
+           "descuento_pct": round(float(r.get("dto") or 0) * 100), "unitario_cent": r.get("unitario_cent"), "cantidad": r.get("q"),
+           "precio": eur(r.get("precio_cent")) + " + IVA", "pvp_tachado": eur(r.get("pvp_cent")),
+           "detalle": {k: v for k, v in r.items() if k not in precio_keys and v is not None},
+           "estimado": estimado,
+           "como_pedirlo": ("Se pide en la tienda con el simulador de neón: " if tipo == "neon" else "Se pide en la tienda subiendo el DXF a escala real: ") + FB.url_de(tipo)}
+    if estimado:
+        out["nota"] = ("Precio ORIENTATIVO: " + ("faltan los metros de neón y las piezas exactas (los da el simulador de la tienda)."
+                       if tipo == "neon" else "se ha estimado la forma de las letras; con el DXF (superficie y contorno de cada pieza) sale el precio exacto."))
+    return out
+
+
 def normaliza_lineas(lineas: list) -> list:
     out = []
     for l in lineas or []:
@@ -329,6 +354,27 @@ class BandejaCiegaIn(BaseModel):
     acabado: str = Field("natural", description="natural | ral")
     ral: Optional[str] = None
     observaciones: Optional[str] = None
+    cantidad: int = 1
+
+
+class LetrasIn(BaseModel):
+    tipo: str = Field(..., description="letras_aluminio | letras_pvc_retro | letras_pvc_frontal | letras_metacrilato | letras_alupanel | letras_pvc")
+    texto: Optional[str] = Field(None, description="Texto del rótulo (con alto_mm): precio orientativo")
+    alto_mm: Optional[float] = Field(None, description="Alto de las letras en mm (con texto)")
+    piezas: Optional[list[dict]] = Field(None, description="Cada letra del DXF: {ancho_mm, alto_mm, area_mm2, contorno_mm}; con superficie y contorno el precio es el exacto")
+    opciones: Optional[dict] = Field(None, description="Opciones del tipo (ver GET /v1/precio/letras/opciones)")
+    cantidad: int = 1
+
+
+class NeonIn(BaseModel):
+    ancho_mm: float = Field(..., description="Ancho del rótulo con la base, en mm")
+    alto_mm: float = Field(..., description="Alto del rótulo con la base, en mm")
+    metros_neon: Optional[float] = Field(None, description="Metros de neón (los da el simulador); si no, se estiman")
+    piezas: Optional[int] = Field(None, description="Piezas de neón; si no, se estiman")
+    color: str = Field("rojo", description="rojo | blanco | blanco_calido | violeta | rosa | naranja | amarillo | azul | turquesa | verde | rgb (exterior: blanco, blanco_calido, rojo, violeta, verde o rgb)")
+    ambiente: str = Field("interior", description="interior | exterior")
+    fijacion: str = Field("atornillado", description="atornillado | colgado | autoportante")
+    base: str = Field("metacrilato_10", description="metacrilato_10 | metacrilato_6 | metacrilato_5 | pvc_19")
     cantidad: int = 1
 
 
@@ -421,6 +467,21 @@ async def v_precio_esquina(b: BandejasEsquinaIn, authorization: Optional[str] = 
     return await precio_bandeja(clave_de(authorization, x_api_key), "esquina", b.model_dump())
 
 
+@app.get("/v1/precio/letras/opciones", summary="Tipos de letras corpóreas y sus opciones")
+async def v_opciones_letras():
+    return {t: {"producto": FB.TIPOS[t][1], "url": FB.url_de(t), "opciones": o} for t, o in FB.OPCIONES.items()}
+
+
+@app.post("/v1/precio/letras", summary="Precio de letras corpóreas (aluminio, PVC, metacrilato, alupanel)")
+async def v_precio_letras(b: LetrasIn, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await precio_fabricado(clave_de(authorization, x_api_key), b.tipo, b.model_dump())
+
+
+@app.post("/v1/precio/neon", summary="Precio de un neón a medida")
+async def v_precio_neon(b: NeonIn, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
+    return await precio_fabricado(clave_de(authorization, x_api_key), "neon", b.model_dump())
+
+
 @app.get("/v1/pedidos", summary="Mis pedidos")
 async def v_pedidos(limite: int = 50, authorization: Optional[str] = Header(None), x_api_key: Optional[str] = Header(None)):
     return await rpc("api_pedidos", {"p_clave": clave_de(authorization, x_api_key), "p_limite": limite})
@@ -448,6 +509,8 @@ mcp = FastMCP("Tecnovinyl", instructions=(
     "(queda pendiente) → enseñar el total al usuario → confirmar_pedido. Nunca confirmes sin que el usuario lo apruebe. "
     "Bandejas de composite: precio_bandeja_ciega y precio_bandejas_esquina dan el precio (y el despiece) y la línea lista para el pedido; "
     "pregunta siempre el color, no lo supongas. "
+    "Letras corpóreas y neón: precio_letras y precio_neon dan el precio con el mismo cálculo que la tienda (orientativo si solo hay "
+    "texto y alto; exacto con las medidas de cada pieza del DXF o los metros del simulador de neón). "
     "Los productos por archivo DXF (letras, neón, bandeja calada…) no se pueden pedir por aquí: indícale al usuario que lo haga en " + TIENDA),
     stateless_http=True, json_response=True, streamable_http_path="/",
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
@@ -524,6 +587,38 @@ async def precio_bandejas_esquina(ctx: Context, tramos_mm: list[float], esquinas
     Devuelve el despiece (bandejas y pliegues), el precio sin IVA y linea_para_pedido para crear_pedido_pendiente."""
     return await precio_bandeja(clave_ctx(ctx), "esquina", dict(tramos_mm=tramos_mm, esquinas=esquinas, alto_mm=alto_mm, fondo_mm=fondo_mm,
                                 color=color, medidas_de=medidas_de, acabado=acabado, ral=ral, observaciones=observaciones))
+
+
+@mcp.tool()
+async def precio_letras(ctx: Context, tipo: str, texto: str = "", alto_mm: float = 0, piezas: Optional[list[dict]] = None,
+                        opciones: Optional[dict] = None, cantidad: int = 1) -> dict:
+    """Precio de letras corpóreas fabricadas por Tecnovinyl (cálculo por costes, el mismo de la tienda).
+    tipo: letras_aluminio | letras_pvc_retro | letras_pvc_frontal | letras_metacrilato | letras_alupanel | letras_pvc.
+    Da texto + alto_mm (precio orientativo) o piezas [{ancho_mm, alto_mm, area_mm2, contorno_mm}] de cada letra del DXF (exacto).
+    opciones según el tipo, por ejemplo:
+    letras_aluminio {modelo: retro_difusor|retro|zocalo|frontal|sinluz_varillas|sinluz_pared, fondo, luz: frio|calido|rgb, ral};
+    letras_pvc_retro {grosor: 19|30, material: blanco|negro, luz: sin|frio|calido|rgb, difusor: sin|opal|hielo, acabado: sin|ral, ral,
+    fijacion: varilla|chupetes|sin, montaje: pared|bandeja, bandeja: {w,h,d,color,trasera}};
+    letras_pvc_frontal {luz, frontal: opal|opal20|hielo, acabado, ral, montaje, bandeja};
+    letras_metacrilato {material: incoloro|opal|hielo, grosor: 3|5|8|10, corte: fresadora|laser, fijacion: sin|cinta};
+    letras_alupanel {color: blanco|negro, cara: brillo|mate, acabado: sin|ral, ral, fijacion: sin|cinta};
+    letras_pvc {color: blanco|negro, grosor: 3|5|10|19|30, acabado: sin|ral, ral, fijacion: sin|cinta}.
+    Letras sin luz: 20 mm de alto como mínimo. No se pueden pedir por aquí: se piden en la tienda con el DXF (como_pedirlo)."""
+    return await precio_fabricado(clave_ctx(ctx), tipo, dict(texto=texto or None, alto_mm=alto_mm or None, piezas=piezas,
+                                  opciones=opciones or {}, cantidad=cantidad))
+
+
+@mcp.tool()
+async def precio_neon(ctx: Context, ancho_mm: float, alto_mm: float, metros_neon: float = 0, piezas: int = 0, color: str = "rojo",
+                      ambiente: str = "interior", fijacion: str = "atornillado", base: str = "metacrilato_10", cantidad: int = 1) -> dict:
+    """Precio de un neón a medida (neón flexible de 6 mm en base fresada, con su fuente; cálculo por costes de la tienda).
+    ancho_mm y alto_mm: medida del rótulo con la base. metros_neon y piezas: si no se saben, se estiman (precio orientativo).
+    color: rojo | blanco | blanco_calido | violeta | rosa | naranja | amarillo | azul | turquesa | verde | rgb
+    (en exterior solo blanco, blanco_calido, rojo, violeta, verde y rgb). ambiente: interior | exterior.
+    fijacion: atornillado | colgado | autoportante. base: metacrilato_10 | metacrilato_6 | metacrilato_5 | pvc_19.
+    El regulador con mando (o el controlador RGB, obligatorio con rgb) va aparte. Se pide en la tienda con el simulador (como_pedirlo)."""
+    return await precio_fabricado(clave_ctx(ctx), "neon", dict(ancho_mm=ancho_mm, alto_mm=alto_mm, metros_neon=metros_neon or None,
+                                  piezas=piezas or None, color=color, ambiente=ambiente, fijacion=fijacion, base=base, cantidad=cantidad))
 
 
 @mcp.tool()
