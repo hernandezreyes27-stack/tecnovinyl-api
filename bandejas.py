@@ -121,7 +121,7 @@ def conf_esquina(d: dict) -> dict:
     if not 200 <= H <= 1500 or not 20 <= D <= 300:
         raise ErrorBandeja("alto_mm 200–1500 y fondo_mm 20–300")
     ref = "rotulo" if str(d.get("medidas_de") or "pared").lower().startswith("rot") else "pared"
-    pl = 3050 if color.startswith("blanco") else 4050      # planchas que hay de cada color
+    pl = 4050      # negro y blanco vienen en 4050 × 1500 (blanco 444752, Alex 26/10/2026)
     r = esquina.despiece(tramos, esqs, H, D, ref, pl)
     if r["avisos"] or not r["piezas"]:
         raise ErrorBandeja(" ".join(r["avisos"]) + " Pídelo como presupuesto en " + TIENDA + "#/bandejas/esquina")
