@@ -45,6 +45,7 @@ PARAMS = {
         "alto_mm": "alto del rótulo", "fondo_mm": "fondo o canto, 20 a 300",
         "color": "negro-mate | negro-brillo | blanco-mate | blanco-brillo (pregúntalo siempre)",
         "medidas_de": "pared (medidas tomadas en la pared, por defecto) | rotulo (medida exterior de la cara del rótulo)",
+        "acabado": "natural (color de la plancha) | ral (composite blanco pintado; indica ral)", "ral": "código RAL si acabado = ral",
         "observaciones": "texto libre (dirección de la obra, plazos…)"},
 }
 
@@ -97,7 +98,11 @@ def conf_ciega(d: dict) -> dict:
 
 def conf_esquina(d: dict) -> dict:
     d = dict(d or {})
+    ral = str(d.get("acabado") or "natural").lower() == "ral"
+    if ral:
+        d["color"] = "blanco-mate"      # pintada RAL = composite blanco pintado (Alex 26/10/2026)
     color = _color(d)
+    ralc = str(d.get("ral") or "").strip()[:30]
     tramos = d.get("tramos_mm") or d.get("tramos") or []
     try:
         tramos = [float(t.get("L") if isinstance(t, dict) else t) for t in tramos]
@@ -126,7 +131,8 @@ def conf_esquina(d: dict) -> dict:
     if r["avisos"] or not r["piezas"]:
         raise ErrorBandeja(" ".join(r["avisos"]) + " Pídelo como presupuesto en " + TIENDA + "#/bandejas/esquina")
     r5 = esquina._round
-    return {"h": H, "d": D, "ref": ref, "color": color, "color_nombre": COLORES[color], "plancha": pl,
+    return {"h": H, "d": D, "ref": ref, "color": color, "acabado": "ral" if ral else "natural", "ral": ralc if ral else "",
+            "color_nombre": ("pintada RAL " + (ralc or "(por indicar)") + " sobre composite blanco") if ral else COLORES[color], "plancha": pl,
             "tramos": [{"L": r5(t)} for t in tramos], "esquinas": esqs, "desarrollo": r5(r["total"]),
             "piezas": [{"n": p["n"], "l": r5(p["L"]),
                         "pl": [{"x": r5(q["x"]), "dev": round(q["dev"], 2), "ang": round(q["ang"], 1)} for q in p["pl"]]}

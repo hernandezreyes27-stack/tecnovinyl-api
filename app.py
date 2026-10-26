@@ -344,6 +344,8 @@ class BandejasEsquinaIn(BaseModel):
     fondo_mm: float = Field(..., description="Fondo o canto (20–300)")
     color: str = Field(..., description="negro-mate | negro-brillo | blanco-mate | blanco-brillo")
     medidas_de: str = Field("pared", description="pared | rotulo")
+    acabado: str = Field("natural", description="natural (color de la plancha) | ral (composite blanco pintado)")
+    ral: Optional[str] = None
     observaciones: Optional[str] = None
 
 
@@ -513,14 +515,15 @@ async def precio_bandeja_ciega(ctx: Context, ancho_mm: float, alto_mm: float, fo
 
 
 @mcp.tool()
-async def precio_bandejas_esquina(ctx: Context, tramos_mm: list[float], esquinas: list[dict], alto_mm: float, fondo_mm: float, color: str,
-                                  medidas_de: str = "pared", observaciones: str = "") -> dict:
+async def precio_bandejas_esquina(ctx: Context, tramos_mm: list[float], esquinas: list[dict], alto_mm: float, fondo_mm: float, color: str = "",
+                                  medidas_de: str = "pared", acabado: str = "natural", ral: str = "", observaciones: str = "") -> dict:
     """Despiece y precio de un rótulo de bandejas de composite en una fachada con esquinas, sobre estructura de aluminio con inglete.
     tramos_mm: largo de cada tramo en orden. esquinas: una menos que tramos, [{"tipo": "saliente"|"entrante", "angulo": 90}]
-    (ángulo entre las dos paredes). medidas_de: pared | rotulo. color: negro-mate | negro-brillo | blanco-mate | blanco-brillo (pregúntalo).
+    (ángulo entre las dos paredes). medidas_de: pared | rotulo. color: negro-mate | negro-brillo | blanco-mate | blanco-brillo (pregúntalo),
+    o acabado="ral" con ral="7016" para pintarla de otro color (se hace en composite blanco pintado).
     Devuelve el despiece (bandejas y pliegues), el precio sin IVA y linea_para_pedido para crear_pedido_pendiente."""
     return await precio_bandeja(clave_ctx(ctx), "esquina", dict(tramos_mm=tramos_mm, esquinas=esquinas, alto_mm=alto_mm, fondo_mm=fondo_mm,
-                                color=color, medidas_de=medidas_de, observaciones=observaciones))
+                                color=color, medidas_de=medidas_de, acabado=acabado, ral=ral, observaciones=observaciones))
 
 
 @mcp.tool()
