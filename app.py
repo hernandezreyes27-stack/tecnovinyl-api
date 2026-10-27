@@ -18,12 +18,13 @@ from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
 import bandejas as BJ
 import fabricados as FB
+import interno as INT   # conector interno para Claude Team (27/10/2026): /interno/mcp con login del panel
 
 SB = os.environ.get("SUPABASE_URL", "https://vqfcfbqlycjgqmdfympr.supabase.co").rstrip("/")
 KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 TIENDA = "https://www.tecnovinyl.com/tienda/"
 API_URL = os.environ.get("API_URL", "https://api.tecnovinyl.com")
-VERSION = "1.2"
+VERSION = "1.3"
 
 if not KEY:
     print("AVISO: falta SUPABASE_SERVICE_KEY; las llamadas a la base de datos fallarán")
@@ -670,17 +671,29 @@ class MCPConClaveEnRuta:
 
 app.mount("/mcp", MCPConClaveEnRuta(_mcp_app))
 
+# conector interno (Claude Team): OAuth con el usuario del panel + MCP de solo lectura (interno.py)
+from starlette.routing import Route as _Ruta, Mount as _Montaje
+app.include_router(INT.router)
+app.router.routes.append(_Ruta(INT.RUTA_MCP, endpoint=INT.app_mcp))
+app.router.routes.append(_Montaje(INT.RUTA_MCP, app=INT.app_mcp))
+
 
 @app.on_event("startup")
 async def _arranque():
     # el session manager de MCP necesita arrancar dentro del bucle de eventos
     app.state._mcp_cm = mcp.session_manager.run()
     await app.state._mcp_cm.__aenter__()
+    app.state._mcp_int_cm = INT.mcp_int.session_manager.run()
+    await app.state._mcp_int_cm.__aenter__()
 
 
 @app.on_event("shutdown")
 async def _parada():
     try:
         await app.state._mcp_cm.__aexit__(None, None, None)
+    except Exception:
+        pass
+    try:
+        await app.state._mcp_int_cm.__aexit__(None, None, None)
     except Exception:
         pass
