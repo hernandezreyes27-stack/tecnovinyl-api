@@ -49,7 +49,7 @@ footer{margin-top:50px;padding-top:16px;border-top:1px solid var(--border);color
 <tr><td class="m">GET</td><td class="m">/v1/productos?q=&amp;categoria=</td><td>Busca productos por texto (nombre, referencia, marca) y/o categoría. Sin precios.</td></tr>
 <tr><td class="m">GET</td><td class="m">/v1/productos/{slug}</td><td>Ficha: descripción, atributos, <b>combinaciones</b> (cada una con su <code>variante_id</code>), opciones a medida y cómo se pide según el tipo.</td></tr>
 <tr><td class="m">GET</td><td class="m">/v1/precio/variante/{variante_id}?cantidad=</td><td>Precio con tu tarifa de una combinación.</td></tr>
-<tr><td class="m">POST</td><td class="m">/v1/precio/medidas</td><td>Precio de un producto a medida (<code>ancho_mm</code>, <code>alto_mm</code>, <code>seleccion</code>) o por tabla.</td></tr>
+<tr><td class="m">POST</td><td class="m">/v1/precio/medidas</td><td>Precio de un producto a medida (<code>ancho_mm</code>, <code>alto_mm</code>, <code>seleccion</code>) o por tabla. Las medidas tienen que estar dentro de los límites de la ficha (<code>limites_mm</code>). En los <b>plafones con iluminación</b> (<code>"Iluminación": "Con iluminación"</code>), <code>total_cent</code> es el plafón más sus tubos o módulos LED, como en la tienda, y el bloque <code>iluminacion</code> lleva cada referencia con su cantidad y su precio; <code>tipo_iluminacion</code>: <code>tubos</code> | <code>modulos</code>.</td></tr>
 <tr><td class="m">POST</td><td class="m">/v1/precio/bandeja-ciega</td><td>Precio de una <b>bandeja ciega de composite</b> a medida (<code>ancho_mm</code>, <code>alto_mm</code>, <code>fondo_mm</code>, <code>color</code>, <code>esquinas</code>, <code>trasera</code>, <code>acabado</code>, <code>cantidad</code>).</td></tr>
 <tr><td class="m">POST</td><td class="m">/v1/precio/bandejas-esquina</td><td>Despiece y precio de un <b>rótulo de bandejas en fachada con esquinas</b> (<code>tramos_mm</code>, <code>esquinas</code>, <code>alto_mm</code>, <code>fondo_mm</code>, <code>color</code>).</td></tr>
 <tr><td class="m">GET</td><td class="m">/v1/precio/letras/opciones</td><td>Tipos de <b>letras corpóreas</b> y las opciones de cada uno.</td></tr>
@@ -78,7 +78,14 @@ curl -X POST -H "Authorization: Bearer tv_live_…" "{{API_URL}}/v1/pedidos/64f1
 <h3>Ejemplo: recorte de metacrilato a medida</h3>
 <pre><code>curl -X POST -H "Authorization: Bearer tv_live_…" -H "Content-Type: application/json" \
   -d '{"producto_id":"&lt;producto_id de Metacrilato Incoloro (recortes)&gt;","ancho_mm":600,"alto_mm":400,"seleccion":{"Espesor":"3 mm"},"cantidad":2}' \
-  "{{API_URL}}/v1/precio/medidas"</code></pre>
+  "{{API_URL}}/v1/precio/medidas"
+
+# plafón Barcelona de 2000 × 1000 con iluminación de tubos LED y sin frontal
+curl -X POST -H "Authorization: Bearer tv_live_…" -H "Content-Type: application/json" \
+  -d '{"producto_id":"&lt;producto_id de Plafón Barcelona&gt;","ancho_mm":2000,"alto_mm":1000,"seleccion":{"Iluminación":"Con iluminación","Frontal de metacrilato":"Sin frontal"},"tipo_iluminacion":"tubos"}' \
+  "{{API_URL}}/v1/precio/medidas"
+# → total_cent (plafón + iluminación), plafon_cent, iluminacion.lineas[{referencia, cantidad, unitario_cent, total_cent}]
+# Al pedirlo (POST /v1/pedidos con esa misma línea), los tubos o módulos se añaden solos en sus líneas.</code></pre>
 <p class="note">Las opciones (<code>seleccion</code>) se escriben con el nombre y el valor exactos que devuelve la ficha en <code>opciones</code>. Lo que no se indica va con el valor por defecto.</p>
 
 <h3>Ejemplo: rótulo de bandejas en una esquina</h3>

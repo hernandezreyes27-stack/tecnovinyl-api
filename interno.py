@@ -15,6 +15,9 @@ Impresiona y que tú le mandes un resumen».
   URL https); solo se admiten direcciones de vuelta de Claude (claude.ai, claude.com, anthropic.com) o de este equipo
   (localhost).
 - Cada consulta queda en interno_registro (quién, qué herramienta y con qué datos).
+- Presupuestos de fabricados (27/10/2026, SQL 154): letras, neón y bandejas con el mismo cálculo que la tienda
+  (interno_precio_fabricado). Desglose de costes solo para oficina y administración. Bandejas también en composite
+  de color de la tarifa (como la amarilla RAL 1023 de Agromart).
 """
 import os, re, json, time, base64, hmac, hashlib, secrets, html, asyncio
 from typing import Any, Optional
@@ -24,6 +27,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from mcp.server.fastmcp import FastMCP, Context
 from mcp.server.transport_security import TransportSecuritySettings
+import fabricados as FB
+import bandejas as BJ
 
 SB = os.environ.get("SUPABASE_URL", "https://vqfcfbqlycjgqmdfympr.supabase.co").rstrip("/")
 KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
@@ -376,7 +381,12 @@ mcp_int = FastMCP("Tecnovinyl · interno", instructions=(
     "Contesta en castellano, con un resumen corto, cifras redondeadas y lo más importante primero (total, cuándo, qué). "
     "Si una herramienta devuelve «elige», pregunta cuál de esos clientes es. No inventes: si un dato no está, dilo. "
     "Para clientes usa su nombre o su código de AHORA. En AHORA el metacrilato aparece como «META». "
-    "Son datos internos: no los mandes a clientes ni fuera de la empresa sin que lo pida quien pregunta."),
+    "Son datos internos: no los mandes a clientes ni fuera de la empresa sin que lo pida quien pregunta. "
+    "PRESUPUESTOS de fabricados (letras corpóreas, neón, bandejas): usa precio_letras, precio_neon, precio_bandeja_ciega y "
+    "precio_bandejas_esquina, que calculan igual que la tienda. Antes, pregunta lo que falte (medidas, color o RAL, luz, "
+    "fijación, trasera). Da el PVP de tarifa y el neto (profesionales −30 %) sin IVA, una línea por cosa. Con texto y alto, "
+    "el precio de las letras es orientativo: dilo. Lo que venga en «solo_oficina» (costes, márgenes, tiempos) nunca va "
+    "al cliente."),
     stateless_http=True, json_response=True, streamable_http_path="/",
     transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False))
 
@@ -493,6 +503,345 @@ async def precio_cliente(ctx: Context, cliente: str, texto: str, cantidad: float
     """Lo que le cuesta a un cliente concreto en la tienda web (con sus descuentos) un producto, buscado por referencia de
     AHORA o por palabras. Precio sin IVA, por unidad de venta."""
     return await consulta(ctx, "precio_cliente", "interno_precio_cliente", {"p_cliente": cliente, "p_texto": texto, "p_cantidad": cantidad})
+
+
+# ----------------------------------------------------------------------------- presupuestos de fabricados (SQL 154)
+# Alex 27/10/2026: «¿podrá también ayudar a mis chicos de la oficina a hacer presupuestos como hemos hecho con Agromart?».
+# Mismo cálculo que la tienda (interno_precio_fabricado). El desglose de costes solo lo ven oficina y administración, como en
+# la tienda; el resto (jefe de taller) solo el precio. Las bandejas pueden ir en composite de color de la tarifa
+# (color_plancha: amarillo RAL 1023, rojo…), como la de Agromart Sa Cabaneta.
+VEN_COSTES = {"admin", "oficina"}
+PRECIO = {"precio_cent", "pvp_cent", "unitario_cent", "pvp_unitario_cent", "dto", "q", "error", "juntas"}
+COSTES = {"desglose", "coste", "margen", "min_taller", "min_maquina", "pint", "plancha_ref", "pintura_m2", "fuente_txt", "min_fres",
+          "fres", "taller", "con_margen", "neon_ref", "base_ref", "fuente_ref", "piezas_det", "piezas", "comp", "est", "m_tubo",
+          "n_ref", "n_esc", "min_base", "mano_obra_extra", "plancha", "plancha_contra", "temporada_pct"}
+TRASERAS = {"estructura": "con estructura de aluminio", "contra": "con contrabandeja", "sin": "sin trasera"}
+TXT_OPC = {
+    "luz": {"sin": "sin luz", "frio": "LED blanco frío", "calido": "LED blanco cálido", "rgb": "LED RGB"},
+    "difusor": {"sin": "sin difusor", "opal": "difusor opal", "hielo": "difusor hielo"},
+    "fijacion": {"varilla": "con varillas", "chupetes": "con chupetes", "sin": "sin fijación", "cinta": "con cinta adhesiva"},
+    "modelo": {"retro_difusor": "retroiluminadas con difusor", "retro": "retroiluminadas", "zocalo": "con zócalo",
+               "frontal": "frontiluminadas", "sinluz_varillas": "sin luz, con varillas", "sinluz_pared": "sin luz, directas a la pared"},
+    "frontal": {"opal": "frente opal", "opal20": "frente opal de 20 mm", "hielo": "frente hielo"},
+    "corte": {"fresadora": "corte con fresadora", "laser": "corte láser"},
+}
+
+
+def _eur(c) -> Optional[str]:
+    if c is None:
+        return None
+    s = f"{c / 100:,.2f}"
+    return s.replace(",", "·").replace(".", ",").replace("·", ".") + " €"
+
+
+def _limpia(args: dict) -> dict:
+    out = {}
+    for k, v in args.items():
+        if v in (None, "", [], {}, 0):
+            continue
+        out[k] = (f"{len(v)} piezas" if k == "piezas" and isinstance(v, list) else v)
+    return out
+
+
+async def _calcula(ctx: Context, herramienta: str, tipo: str, conf: dict, args: dict, planchas=None):
+    """Devuelve (resultado, ve_costes) o (None, {error})."""
+    u = quien(ctx)
+    asyncio.create_task(registrar_uso(u.get("sub"), u.get("nom"), herramienta, _limpia(args)))
+    ver = u.get("rol") in VEN_COSTES
+    r = await _db.post("/rpc/interno_precio_fabricado", json={"p_tipo": tipo, "p": conf, "p_planchas": planchas, "p_desglose": ver},
+                       headers={"Content-Type": "application/json"})
+    if r.status_code >= 400:
+        try:
+            msg = r.json().get("message") or r.text
+        except Exception:
+            msg = r.text
+        return None, {"error": "No se ha podido calcular: " + str(msg)[:300]}
+    d = r.json()
+    if d.get("error"):
+        return None, {"error": d["error"] + (" Lleva juntas: hay que estudiarlo con el taller antes de dar precio." if d.get("juntas") else "")}
+    return (d, ver), None
+
+
+def _salida(concepto: str, d: dict, ver: bool, extra: Optional[dict] = None) -> dict:
+    dto = float(d.get("dto") or 0)
+    q = d.get("q") or 1
+    neto, pvp = d.get("precio_cent"), d.get("pvp_cent")
+    out = {"concepto": concepto, "cantidad": q, "pvp_tarifa": _eur(pvp), "neto": (_eur(neto) or "") + " + IVA",
+           "descuento": f"{round(dto * 100)} %", "neto_con_iva": _eur(round(neto * 1.21)) if neto is not None else None,
+           "neto_unidad": _eur(d.get("unitario_cent")) if q > 1 else None, "pvp_cent": pvp, "neto_cent": neto}
+    detalle = {k: v for k, v in d.items() if k not in PRECIO and k not in COSTES and v is not None and k != "bandeja"}
+    if detalle:
+        out["detalle"] = detalle
+    if extra:
+        out.update(extra)
+    if ver:
+        costes = {k: d[k] for k in COSTES if k in d and d[k] is not None}
+        if costes:
+            out["solo_oficina"] = dict(costes, aviso="Costes, márgenes y tiempos internos: nunca se enseñan al cliente.")
+        if d.get("temporada_pct"):
+            out["temporada"] = f"Recargo de temporada activo: +{d['temporada_pct']} % (ya va en el precio)."
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _color_corto(desc: str, ref: str) -> str:
+    s = (desc or "").upper()
+    m = re.match(r"COMPOSITE 3 ?MM (.+?)(?:/|\s\d{4}\s?X)", s)
+    nombre = (m.group(1) if m else s).strip().lower()
+    ral = re.search(r"RAL (?:APROX\.? )?(\d{4})", s)
+    return f"{nombre}{' RAL ' + ral.group(1) if ral else ''} ({ref})"
+
+
+async def _plancha_color(texto: str):
+    r = await _db.post("/rpc/interno_planchas_bandeja", json={"p_texto": texto}, headers={"Content-Type": "application/json"})
+    lst = r.json() if r.status_code < 400 else []
+    exacta = [x for x in lst if x["ref"].upper() == texto.strip().upper()]
+    if len(exacta) == 1:
+        return exacta[0], None
+    if len(lst) == 1:
+        return lst[0], None
+    if not lst:
+        return None, {"error": f"No encuentro una plancha de composite de 3 mm de color «{texto}» en la tarifa. Mira colores_composite, "
+                               "o hazla en blanco pintada (acabado ral)."}
+    return None, {"elige": [{"ref": x["ref"], "descripcion": x["descripcion"]} for x in lst],
+                  "nota": "Hay varias planchas que encajan: pregunta cuál, o pasa la referencia en color_plancha."}
+
+
+def _estima_lineas(lineas: list) -> tuple:
+    """Piezas estimadas (como la API) para varias líneas de texto con su alto, y la caja del conjunto."""
+    piezas, anchos, altos = [], [], []
+    for i, ln in enumerate(lineas or []):
+        t, h = str(ln.get("texto") or ""), ln.get("alto_mm")
+        try:
+            pz, _, caja = FB.piezas_de({"texto": t, "alto_mm": h})
+        except FB.ErrorFab as e:
+            raise FB.ErrorFab(f"lineas[{i}]: {e}")
+        piezas += [{"ancho_mm": p["w"], "alto_mm": p["h"], "area_mm2": p["a"], "contorno_mm": p["p"]} for p in pz]
+        anchos.append(caja["w"]); altos.append(caja["h"])
+    if not piezas:
+        raise FB.ErrorFab("lineas: hace falta al menos una línea con texto y alto_mm")
+    alto = sum(altos) + round(0.3 * max(altos)) * (len(altos) - 1)
+    return piezas, {"w": max(anchos), "h": alto}
+
+
+def _resumen_letras(tipo: str, op: dict, d: dict) -> str:
+    partes = [re.sub(r"\s*\(.*?\)", "", FB.TIPOS[tipo][1])]
+    for k, v in op.items():
+        if k in ("bandeja", "montaje", "ral") or v in (None, ""):
+            continue
+        if k == "acabado":
+            partes.append(f"pintadas RAL {op.get('ral') or '(por indicar)'}" if v == "ral" else "sin pintar")
+        elif k in TXT_OPC:
+            partes.append(TXT_OPC[k].get(str(v), f"{k} {v}"))
+        elif k in ("material", "color"):
+            partes.append(str(v))
+        elif k == "cara":
+            partes.append(f"cara {v}")
+        elif k == "grosor":
+            partes.append(f"{v} mm")
+        elif k == "fondo":
+            partes.append(f"canto de {v} mm")
+        else:
+            partes.append(f"{k} {v}")
+    if op.get("montaje") == "bandeja":
+        partes.append("montadas sobre bandeja")
+    if d.get("n"):
+        partes.append(f"{d['n']} piezas" + (f", alto máx. {d['alto_max']} mm" if d.get("alto_max") else ""))
+    return " · ".join(partes)
+
+
+@mcp_int.tool()
+async def opciones_fabricados(ctx: Context) -> dict:
+    """Qué fabricados se pueden presupuestar con las herramientas precio_* y qué opciones admite cada uno. Mírala antes de
+    calcular si dudas de un valor."""
+    quien(ctx)
+    return {
+        "letras (precio_letras)": {t: {"producto": FB.TIPOS[t][1], "opciones": FB.OPCIONES[t]} for t in FB.OPCIONES},
+        "neon (precio_neon)": {"ancho_mm/alto_mm": "medida del rótulo con la base", "metros_neon/piezas": "si no se saben, se estiman",
+                               "color": "rojo | blanco | blanco_calido | violeta | rosa | naranja | amarillo | azul | turquesa | verde | rgb",
+                               "ambiente": "interior | exterior (en exterior solo blanco, blanco_calido, rojo, violeta, verde y rgb)",
+                               "fijacion": "atornillado | colgado | autoportante", "base": "metacrilato_10 | metacrilato_6 | metacrilato_5 | pvc_19"},
+        "bandeja_ciega (precio_bandeja_ciega)": dict(BJ.PARAMS["bandeja_ciega"], color_plancha="composite de 3 mm de color de la tarifa "
+                                                     "(amarillo RAL 1023, rojo, azul…; ver colores_composite) en vez de blanco o negro"),
+        "bandejas_esquina (precio_bandejas_esquina)": BJ.PARAMS["bandejas_esquina"],
+        "reglas": [
+            "Es el mismo cálculo por costes que la tienda. A profesionales: PVP de tarifa −30 %. Precios sin IVA.",
+            "Letras: con texto y alto el precio es ORIENTATIVO (se estima la forma); con las medidas de cada pieza del DXF "
+            "(ancho, alto, superficie y contorno) es exacto. También se puede sacar exacto en la tienda (modo oficina) subiendo el DXF.",
+            "Letras sin luz: 20 mm de alto como mínimo. Letras sobre bandeja: la bandeja tiene que sobresalir 50 mm por cada lado.",
+            "Bandeja: composite de 3 mm, de 300 a 12.000 mm. Si abierta (lo corto + 2 × fondo) pasa de 1.480 mm lleva juntas: "
+            "hay que estudiarla.",
+            "Bandeja de color: blanco o negro, blanco pintado RAL (la pintura cuesta 150 € como mínimo) o una plancha de composite "
+            "de color de la tarifa con color_plancha (sin pintar).",
+            "Bandeja calada: necesita el DXF del cliente; se calcula en la tienda (modo oficina).",
+        ]}
+
+
+@mcp_int.tool()
+async def colores_composite(ctx: Context, texto: str = "") -> Any:
+    """Planchas de composite de 3 mm de color de la tarifa (además del blanco y el negro) que se pueden usar en las bandejas
+    con color_plancha: referencia, descripción y ancho de la plancha. «texto» filtra (p. ej. «amarillo», «1023», «rojo»)."""
+    u = quien(ctx)
+    lst = await consulta(ctx, "colores_composite", "interno_planchas_bandeja", {"p_texto": texto or None})
+    if not isinstance(lst, list):
+        return lst
+    if u.get("rol") not in VEN_COSTES:
+        lst = [{k: v for k, v in x.items() if k != "precio_plancha"} for x in lst]
+    return {"planchas": lst, "nota": "Además están el blanco y el negro (color en precio_bandeja_ciega) y el blanco pintado RAL."}
+
+
+@mcp_int.tool()
+async def precio_bandeja_ciega(ctx: Context, ancho_mm: float, alto_mm: float, fondo_mm: float, trasera: str, color: str = "",
+                               color_plancha: str = "", acabado: str = "natural", ral: str = "", esquinas: str = "v",
+                               cantidad: int = 1) -> Any:
+    """Presupuesto de una bandeja ciega de composite de 3 mm a medida (mismo cálculo por costes que la tienda).
+    trasera: estructura (de aluminio, lo normal en fachada) | contra (contrabandeja) | sin. Pregúntala si no la dicen.
+    Color, una de tres: color = negro-mate | negro-brillo | blanco-mate | blanco-brillo; o acabado = "ral" con ral = "7016"
+    (blanco pintado); o color_plancha = una plancha de composite de color de la tarifa (p. ej. "amarillo 1023" o su
+    referencia; ver colores_composite). esquinas: v | recta. Devuelve PVP de tarifa, neto (−30 %) y, a la oficina, el desglose."""
+    args = dict(ancho_mm=ancho_mm, alto_mm=alto_mm, fondo_mm=fondo_mm, trasera=trasera, color=color, color_plancha=color_plancha,
+                acabado=acabado, ral=ral, esquinas=esquinas, cantidad=cantidad)
+    d = dict(ancho_mm=ancho_mm, alto_mm=alto_mm, fondo_mm=fondo_mm, color=color, trasera=trasera, acabado=acabado, ral=ral,
+             esquinas=esquinas, cantidad=cantidad)
+    planchas, nombre = None, None
+    if color_plancha.strip():
+        pl, err = await _plancha_color(color_plancha)
+        if err:
+            return err
+        planchas = [[pl["ref"], pl["ancho_mm"]]]
+        d.update(color="blanco-mate", acabado="natural", ral="")
+        nombre = _color_corto(pl["descripcion"], pl["ref"])
+    elif not color and str(acabado).lower() == "ral":
+        d["color"] = "blanco-mate"
+    try:
+        conf = BJ.conf_ciega(d)
+    except BJ.ErrorBandeja as e:
+        return {"error": str(e)}
+    res, err = await _calcula(ctx, "precio_bandeja_ciega", "bandeja_ciega", conf, args, planchas)
+    if err:
+        return err
+    r, ver = res
+    color_txt = nombre or (f"blanco pintado RAL {conf['ral'] or '(por indicar)'}" if conf["acabado"] == "ral" else conf["color_nombre"].lower())
+    concepto = (f"Bandeja ciega de composite {color_txt}, {conf['w']} × {conf['h']} × {conf['d']} mm, {TRASERAS[conf['trasera']]}"
+                + (", esquinas rectas" if conf["esq"] == "recta" else ""))
+    extra = {}
+    if (r.get("n") or 1) > 1:
+        extra["nota"] = f"Por su largo va en {r['n']} piezas de {r.get('lp')} × {r.get('c')} mm a tope sobre una sola estructura."
+    return _salida(concepto, r, ver, extra)
+
+
+@mcp_int.tool()
+async def precio_bandejas_esquina(ctx: Context, tramos_mm: list[float], esquinas: list[dict], alto_mm: float, fondo_mm: float,
+                                  color: str = "", medidas_de: str = "pared", acabado: str = "natural", ral: str = "") -> Any:
+    """Presupuesto de un rótulo de bandejas de composite en una fachada con esquinas, sobre estructura de aluminio con inglete
+    (mismo cálculo que la tienda). tramos_mm: largo de cada tramo, en orden. esquinas: una menos que tramos,
+    [{"tipo": "saliente"|"entrante", "angulo": 90}] (ángulo entre las dos paredes). medidas_de: pared | rotulo.
+    color: negro-mate | negro-brillo | blanco-mate | blanco-brillo, o acabado = "ral" con ral (blanco pintado).
+    Devuelve el despiece (bandejas y pliegues), PVP de tarifa y neto (−30 %)."""
+    args = dict(tramos_mm=tramos_mm, esquinas=esquinas, alto_mm=alto_mm, fondo_mm=fondo_mm, color=color, medidas_de=medidas_de,
+                acabado=acabado, ral=ral)
+    try:
+        conf = BJ.conf_esquina(dict(args))
+    except BJ.ErrorBandeja as e:
+        return {"error": str(e)}
+    res, err = await _calcula(ctx, "precio_bandejas_esquina", "bandejas_esquina", conf, args)
+    if err:
+        return err
+    r, ver = res
+    m = f"{conf['desarrollo'] / 1000:.2f}".replace(".", ",")
+    concepto = (f"Bandejas de composite en esquina · {m} m de desarrollo × {conf['h']} mm, fondo {conf['d']} mm"
+                f" · {len(conf['piezas'])} bandejas · {conf['color_nombre'].lower()} · con estructura de aluminio con inglete")
+    return _salida(concepto, r, ver, {"despiece": BJ.despiece_legible(conf)})
+
+
+@mcp_int.tool()
+async def precio_letras(ctx: Context, tipo: str, texto: str = "", alto_mm: float = 0, lineas: Optional[list[dict]] = None,
+                        piezas: Optional[list[dict]] = None, opciones: Optional[dict] = None, cantidad: int = 1,
+                        ancho_conjunto_mm: float = 0, alto_conjunto_mm: float = 0, color_plancha_bandeja: str = "") -> Any:
+    """Presupuesto de letras corpóreas o formas fabricadas por Tecnovinyl (mismo cálculo por costes que la tienda).
+    tipo: letras_aluminio | letras_pvc_retro | letras_pvc_frontal | letras_metacrilato | letras_alupanel | letras_pvc.
+    Medidas, una de tres: texto + alto_mm (una línea); lineas = [{"texto": "AGRO", "alto_mm": 170}, {"texto": "MART", ...}]
+    para varias líneas o altos distintos (las dos dan precio ORIENTATIVO); o piezas = [{ancho_mm, alto_mm, area_mm2,
+    contorno_mm}] de cada pieza del DXF (exacto). ancho_conjunto_mm/alto_conjunto_mm: medida total del rótulo si se sabe.
+    opciones según el tipo (ver opciones_fabricados), p. ej. letras_pvc_retro {grosor: 19|30, material: blanco|negro,
+    luz: sin|frio|calido|rgb, difusor: sin|opal|hielo, acabado: sin|ral, ral, fijacion: varilla|chupetes|sin,
+    montaje: pared|bandeja, bandeja: {w, h, d, color: blanco-mate|negro-mate|…, acabado: natural|ral, ral,
+    trasera: estructura|contra|sin}}. color_plancha_bandeja: bandeja en composite de color de la tarifa (p. ej. "amarillo 1023").
+    Con montaje bandeja devuelve dos líneas: la bandeja y las letras con su montaje."""
+    op = dict(opciones or {})
+    args = dict(tipo=tipo, texto=texto, alto_mm=alto_mm, lineas=lineas, piezas=piezas, opciones=op, cantidad=cantidad,
+                ancho_conjunto_mm=ancho_conjunto_mm, alto_conjunto_mm=alto_conjunto_mm, color_plancha_bandeja=color_plancha_bandeja)
+    if tipo not in FB.OPCIONES:
+        return {"error": "tipo no válido: " + ", ".join(FB.OPCIONES)}
+    planchas, nombre = None, None
+    if color_plancha_bandeja.strip():
+        if op.get("montaje") != "bandeja" or not isinstance(op.get("bandeja"), dict):
+            return {"error": "color_plancha_bandeja solo vale con opciones.montaje = bandeja y opciones.bandeja {w, h, d, trasera}."}
+        pl, err = await _plancha_color(color_plancha_bandeja)
+        if err:
+            return err
+        planchas = [[pl["ref"], pl["ancho_mm"]]]
+        op["bandeja"] = dict(op["bandeja"], color="blanco-mate", acabado="natural", ral="")
+        nombre = _color_corto(pl["descripcion"], pl["ref"])
+    try:
+        if lineas:
+            pz, caja = _estima_lineas(lineas)
+            conf, est = FB.conf_letras(tipo, {"piezas": pz, "opciones": op, "cantidad": cantidad})
+            conf["caja"], est = caja, True
+        else:
+            conf, est = FB.conf_letras(tipo, {"texto": texto or None, "alto_mm": alto_mm or None, "piezas": piezas,
+                                             "opciones": op, "cantidad": cantidad})
+    except FB.ErrorFab as e:
+        return {"error": str(e)}
+    if ancho_conjunto_mm and alto_conjunto_mm:
+        conf["caja"] = {"w": round(ancho_conjunto_mm), "h": round(alto_conjunto_mm)}
+    res, err = await _calcula(ctx, "precio_letras", tipo, conf, args, planchas)
+    if err:
+        return err
+    r, ver = res
+    concepto = _resumen_letras(tipo, op, r)
+    extra = {"estimado": est}
+    if est:
+        extra["nota"] = ("Precio ORIENTATIVO: se ha estimado la forma de las letras. Con el DXF (superficie y contorno de cada pieza) "
+                         "sale el exacto.")
+    b = r.get("bandeja")
+    if isinstance(b, dict) and b.get("precio_cent"):
+        dto = float(r.get("dto") or 0)
+        bn = int(b["precio_cent"]); ln = int(r["precio_cent"]) - bn
+        bp = round(bn / (1 - dto)) if dto < 1 else bn
+        lp = int(r["pvp_cent"]) - bp
+        bcolor = nombre or (f"blanco pintado RAL {b.get('ral') or '(por indicar)'}" if b.get("acabado") == "ral" else str(b.get("color") or ""))
+        extra["lineas"] = [
+            {"concepto": f"Bandeja ciega de composite {bcolor}, {b.get('w')} × {b.get('h')} × {b.get('d')} mm, "
+                         f"{TRASERAS.get(b.get('trasera'), b.get('trasera'))}", "pvp_tarifa": _eur(bp), "neto": _eur(bn)},
+            {"concepto": concepto + " (con el montaje sobre la bandeja)", "pvp_tarifa": _eur(lp), "neto": _eur(ln)}]
+    return _salida(concepto, r, ver, extra)
+
+
+@mcp_int.tool()
+async def precio_neon(ctx: Context, ancho_mm: float, alto_mm: float, color: str = "rojo", metros_neon: float = 0, piezas: int = 0,
+                      ambiente: str = "interior", fijacion: str = "atornillado", base: str = "metacrilato_10", cantidad: int = 1) -> Any:
+    """Presupuesto de un neón a medida (neón flexible de 6 mm en base fresada, con su fuente; mismo cálculo que la tienda).
+    ancho_mm y alto_mm: medida del rótulo con la base. metros_neon y piezas: si no se saben se estiman (precio orientativo;
+    el simulador de la tienda da los exactos). color: rojo | blanco | blanco_calido | violeta | rosa | naranja | amarillo |
+    azul | turquesa | verde | rgb (en exterior solo blanco, blanco_calido, rojo, violeta, verde y rgb). ambiente: interior |
+    exterior. fijacion: atornillado | colgado | autoportante. base: metacrilato_10 | metacrilato_6 | metacrilato_5 | pvc_19.
+    El regulador con mando (o el controlador RGB, obligatorio con rgb) va aparte."""
+    args = dict(ancho_mm=ancho_mm, alto_mm=alto_mm, color=color, metros_neon=metros_neon, piezas=piezas, ambiente=ambiente,
+                fijacion=fijacion, base=base, cantidad=cantidad)
+    try:
+        conf, est = FB.conf_neon(dict(args, metros_neon=metros_neon or None, piezas=piezas or None))
+    except FB.ErrorFab as e:
+        return {"error": str(e)}
+    res, err = await _calcula(ctx, "precio_neon", "neon", conf, args)
+    if err:
+        return err
+    r, ver = res
+    concepto = (f"Neón a medida {conf['w']} × {conf['h']} mm, {conf['metros']} m de neón {color.replace('_', ' ')}, "
+                f"{'exterior' if conf['ambiente'] == 'exterior' else 'interior'}, base {base.replace('_', ' ')}, {fijacion}")
+    extra = {"estimado": est}
+    if est:
+        extra["nota"] = "Precio ORIENTATIVO: faltan los metros de neón y las piezas exactas (los da el simulador de la tienda)."
+    return _salida(concepto, r, ver, extra)
 
 
 _mcp_app = mcp_int.streamable_http_app()

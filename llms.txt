@@ -23,6 +23,9 @@
 - Servidor MCP (Claude, ChatGPT y otros): `{{API_URL}}/mcp/<clave>` (streamable HTTP) o `{{API_URL}}/mcp` con la cabecera Authorization.
 - Flujo: GET /v1/productos?q= → GET /v1/productos/{slug} → GET /v1/precio/variante/{variante_id} o POST /v1/precio/medidas
   → POST /v1/pedidos (queda pendiente) → POST /v1/pedidos/{id}/confirmar. Importes en céntimos, sin IVA salvo total_cent del pedido.
+- Plafones con iluminación (Barcelona y Barcelona mini, opción «Iluminación»: «Con iluminación»): POST /v1/precio/medidas devuelve en
+  total_cent el plafón más sus tubos o módulos LED y su fuente (desglose en `iluminacion`), igual que la tienda; `tipo_iluminacion`:
+  tubos | modulos. POST /v1/pedidos añade esas líneas solo. Las medidas se comprueban con los límites de la ficha.
 - Bandejas de composite: POST /v1/precio/bandeja-ciega y POST /v1/precio/bandejas-esquina (fachada con esquinas: tramos y
   ángulos → despiece y precio). Devuelven `linea_para_pedido` para POST /v1/pedidos. Pregunta siempre el color.
 - Letras corpóreas y neón (solo precio, mismo cálculo por costes que la tienda): POST /v1/precio/letras (tipo, texto + alto_mm
